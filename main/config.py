@@ -13,18 +13,18 @@ RIGHT_SUBTREE_TREES_PER_VARIANT = 3
 MAX_VARIANTS = 2
 
 # Path to save run-time statistics and logs
-STATS_FILE_PATH = "/path/to/save/statistics_log.txt"
+STATS_FILE_PATH = "output/statistics_log.txt"
 
 # OpenAI-compatible language model API settings
-BASE_URL = "https://your-openai-compatible-api-url/v1"
-API_KEY = "your-api-key-string"
+BASE_URL = "http://localhost:8000/v1"
+API_KEY = "YOUR_KEY"
 
 # Path to save generated dense embeddings
-EMBEDDING_DATA = "/path/to/embedding_data_output"
+EMBEDDING_DATA = "data/embeddings"
 
 # External reranker service settings (optional)
-RANKER_URL = "https://your-ranker-service-url/v1"
-RANKER_KEY = "your-ranker-api-key"
+RANKER_URL = "http://localhost:8001/v1"
+RANKER_KEY = "YOUR_KEY"
 
 # Retrieval configuration
 RETRIEVE_TEMPERATURE = 0.3
@@ -39,10 +39,10 @@ SAMPLING_ITERATIONS = 5        # Number of sampling iterations for consensus
 MAX_ITERATIONS = 4             # Maximum number of iterations for query rewriting
 
 # Root output directory for saving predictions/results
-OUTPUT_DIR_ROOT = "/path/to/output/results"
+OUTPUT_DIR_ROOT = "output"
 
 # Concurrency control
 MAX_CONCURRENT = 4              # Maximum number of concurrent QA jobs
 
 # Path to evaluation dataset (in .jsonl format)
-DATA_PATH = "/path/to/dataset.jsonl"
+DATA_PATH = "data/longbench/musique.jsonl"

@@ -172,3 +172,10 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# RT-RAG local artifacts
+data/
+output/
+requirements.pip.txt
+requirements.baseline.txt
+.DS_Store
