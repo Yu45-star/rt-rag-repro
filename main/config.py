@@ -1,3 +1,5 @@
+import os
+
 # Tree generation parameters for hierarchical QA
 TREES_PER_QUESTION = 5           # Number of trees to generate per question (for consensus-based QA)
 MAX_TOKENS = 2000                # Maximum number of tokens allowed per tree
@@ -16,15 +18,15 @@ MAX_VARIANTS = 2
 STATS_FILE_PATH = "output/statistics_log.txt"
 
 # OpenAI-compatible language model API settings
-BASE_URL = "http://localhost:8000/v1"
-API_KEY = "YOUR_KEY"
+BASE_URL = os.getenv("RT_RAG_BASE_URL", "http://localhost:8000/v1")
+API_KEY = os.getenv("RT_RAG_API_KEY", "YOUR_KEY")
 
 # Path to save generated dense embeddings
 EMBEDDING_DATA = "data/embeddings"
 
-# External reranker service settings (optional)
-RANKER_URL = "http://localhost:8001/v1"
-RANKER_KEY = "YOUR_KEY"
+# Embedding service settings used for dense retrieval query encoding
+RANKER_URL = os.getenv("RT_RAG_RANKER_URL", os.getenv("RT_RAG_EMBED_BASE_URL", "http://localhost:8001/v1"))
+RANKER_KEY = os.getenv("RT_RAG_RANKER_KEY", os.getenv("RT_RAG_EMBED_API_KEY", os.getenv("OPENAI_API_KEY", "YOUR_KEY")))
 
 # Retrieval configuration
 RETRIEVE_TEMPERATURE = 0.3

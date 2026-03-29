@@ -99,6 +99,7 @@ ipython_config.py
 #   This is especially recommended for binary packages to ensure reproducibility, and is more
 #   commonly ignored for libraries.
 #uv.lock
+.uv-cache/
 
 # poetry
 #   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
@@ -129,6 +130,7 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
 .venv
 env/
 venv/
@@ -176,6 +178,7 @@ cython_debug/
 # RT-RAG local artifacts
 data/
 output/
+models/
 requirements.pip.txt
 requirements.baseline.txt
 .DS_Store

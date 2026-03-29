@@ -17,20 +17,81 @@ Once the tree is built, a **bottom-up traversal strategy** is used to iterativel
 
 ## ⚙️ 1. Environment Setup
 
-### ✅ Install Dependencies
+### ✅ Quick Start With uv
+
+Cloning the repo on a fresh machine, the shortest setup path is:
 
 ```bash
-pip install -r requirements.txt
+python3 -m pip install --user uv
+uv sync --frozen
+uv pip install https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+```
+
+This project now uses `pyproject.toml` + `uv.lock` as the source of truth for dependencies, so everyone installs the same resolved environment.
+
+### ✅ Create or Refresh the Environment
+
+Install `uv` first if it is not already available:
+
+```bash
+python3 -m pip install --user uv
+```
+
+Create the environment and sync dependencies from `pyproject.toml`:
+
+```bash
+uv venv
+uv sync
+```
+
+Install the spaCy English model separately so dependency sync stays portable:
+
+```bash
+uv pip install https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+```
+
+`requirements.txt` is kept only as a compatibility file. The primary dependency source is `pyproject.toml`.
+
+The config files now read API secrets from environment variables first, so you do not need to hardcode keys in the repository.
+
+For OpenAI-only usage:
+
+```bash
+export OPENAI_API_KEY="your-openai-api-key"
+export RT_RAG_BASE_URL="https://api.openai.com/v1"
+export RT_RAG_API_KEY="$OPENAI_API_KEY"
+export RT_RAG_RANKER_URL="https://api.openai.com/v1"
+export RT_RAG_RANKER_KEY="$OPENAI_API_KEY"
+export RT_RAG_EMBED_BASE_URL="https://api.openai.com/v1"
+export RT_RAG_EMBED_API_KEY="$OPENAI_API_KEY"
+```
+
+For local Qwen plus OpenAI embeddings:
+
+```bash
+export OPENAI_API_KEY="your-openai-api-key"
+export RT_RAG_BASE_URL="http://localhost:8000/v1"
+export RT_RAG_API_KEY="your-local-llm-key"
+export RT_RAG_RANKER_URL="https://api.openai.com/v1"
+export RT_RAG_RANKER_KEY="$OPENAI_API_KEY"
+export RT_RAG_EMBED_BASE_URL="https://api.openai.com/v1"
+export RT_RAG_EMBED_API_KEY="$OPENAI_API_KEY"
+```
+
+If `uv` cannot write to its default cache directory in a restricted environment, use:
+
+```bash
+uv sync --cache-dir /path/to/uv-cache
 ```
 
 ### ⚡️ (Optional) Serve Qwen2.5-14B-Instruct via vLLM
 
 To serve Qwen2.5-14B-Instruct locally using [vLLM](https://github.com/vllm-project/vllm) with OpenAI-compatible API:
 
-First, install vLLM:
+First, install vLLM inside the uv environment:
 
 ```bash
-pip install vllm
+uv add vllm
 ```
 
 Then, start the server:
@@ -41,9 +102,11 @@ vllm serve Qwen/Qwen2.5-14B-Instruct \
   --api-key your-api-key
 ```
 
-> Replace `your-api-key` with a secure token. This key must match what you configure in `config.py`.
+> Replace `your-api-key` with a secure token. This should match `RT_RAG_API_KEY` if you are using environment-variable-based config.
 
 📝 **Tip:** For more details, see [vLLM OpenAI-Compatible Server Docs](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html)
+
+This is optional and not required for the first environment bootstrap. The default setup is aimed at getting the pipeline running against an OpenAI-compatible API first.
 
 
 ---
@@ -81,6 +144,8 @@ huggingface-cli login
 The preprocessed corpus is already in the `raw` folder.  
 Evaluation and retrieval data are from [LongBench](https://github.com/THUDM/LongBench).
 
+The repository ignores generated artifacts such as `data/`, `output/`, local virtual environments, and uv cache directories so teammates can keep local runs isolated from versioned source files.
+
 ---
 
 ## ✏️ 4. Configure `main/build_dense_index/config.py`
@@ -95,8 +160,8 @@ Update your configuration for embedding/index building:
 | `chunk_size`   | Max words per chunk (e.g., 200) |
 | `min_sentence` | Min sentences per chunk (e.g., 2) |
 | `overlap`      | Overlapping sentences between chunks (e.g., 2) |
-| `base_url`     | API endpoint (e.g., `http://localhost:8000/v1`) |
-| `api_key`      | Your API key used with the embedding service |
+| `base_url`     | Defaults to `RT_RAG_EMBED_BASE_URL` or `RT_RAG_RANKER_URL` |
+| `api_key`      | Defaults to `RT_RAG_EMBED_API_KEY`, `RT_RAG_RANKER_KEY`, or `OPENAI_API_KEY` |
 
 ---
 
@@ -105,7 +170,7 @@ Update your configuration for embedding/index building:
 Once `main/build_dense_index/config.py` is ready, build your FAISS index with:
 
 ```bash
-python build_dense_index/dense_build_index.py
+uv run python main/build_dense_index/dense_build_index.py
 ```
 
 ---
@@ -122,12 +187,12 @@ After the dense index is successfully built:
     main/config.py
     ```
 
-    Make sure the dataset path, retrieval settings, API credentials, and output paths are correct and aligned with the built index.
+    Make sure the dataset path, retrieval settings, environment variables, and output paths are correct and aligned with the built index.
 
 2. Run the full dataset through the system:
 
     ```bash
-    python main/load_data.py
+    uv run python main/load_data.py
     ```
 
 > This step runs the entire dataset through the RT-RAG pipeline: it performs retrieval, reranking, tree generation, and LLM querying.
@@ -143,7 +208,7 @@ After the dense index is successfully built:
 Once inference on the full dataset is complete, you can evaluate the generated answers using:
 
 ```bash
-python main/evaulate.py /path/to/result.txt
+uv run python main/evaulate.py /path/to/result.txt
 ```
 > Replace `/path/to/result.txt` with the actual path to the output file generated by `main/load_data.py`.
 
@@ -165,7 +230,4 @@ The table below summarizes RT-RAG's performance across three benchmark datasets 
 |                | **Average** | **63.32** | **51.33** |
 
 > RT-RAG consistently outperforms all baselines across diverse multi-hop QA datasets.
-
-
-
 
