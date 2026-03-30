@@ -84,6 +84,17 @@ If `uv` cannot write to its default cache directory in a restricted environment,
 uv sync --cache-dir /path/to/uv-cache
 ```
 
+### ✅ (Optional) Store Hugging Face cache in the workspace volume
+
+If your persistent volume is mounted at `/workspace`, set these variables before running any `huggingface-cli download`, `vllm serve`, or first-time model load so Hugging Face caches are stored there instead of the default `~/.cache/huggingface` location:
+
+```bash
+mkdir -p /workspace/hf-cache
+export HF_HOME=/workspace/hf-cache
+export HUGGINGFACE_HUB_CACHE=/workspace/hf-cache/hub
+export TRANSFORMERS_CACHE=/workspace/hf-cache/transformers
+```
+
 ### ⚡️ (Optional) Serve Qwen2.5-14B-Instruct via vLLM
 
 To serve Qwen2.5-14B-Instruct locally using [vLLM](https://github.com/vllm-project/vllm) with OpenAI-compatible API:
@@ -112,6 +123,8 @@ This is optional and not required for the first environment bootstrap. The defau
 ---
 
 ## 📦 2. Model Downloads
+
+If you want model downloads and cache files to live in the workspace volume, run the Hugging Face cache setup commands above first.
 
 You can download models manually or use Hugging Face CLI:
 
