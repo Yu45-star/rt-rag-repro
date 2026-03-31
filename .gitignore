@@ -176,9 +176,11 @@ cython_debug/
 .pypirc
 
 # RT-RAG local artifacts
-data/
+data/embeddings/
 output/
 models/
 requirements.pip.txt
 requirements.baseline.txt
 .DS_Store
+
+note/

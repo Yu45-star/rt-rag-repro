@@ -4,6 +4,7 @@ import uuid
 import numpy as np
 import json
 import math
+import time
 from typing import List, Dict, Tuple, Any
 import spacy
 from datetime import datetime
@@ -13,7 +14,8 @@ from openai import OpenAI
 import argparse
 import faiss
 import torch
-from config import BASE_URL,API_KEY,RANKER_URL,RANKER_KEY,RETRIEVE_TEMPERATURE,SAMPLING_ITERATIONS,EMBEDDING_DATA
+from config import BASE_URL,API_KEY,MODEL_NAME,RANKER_URL,RANKER_KEY,RETRIEVE_TEMPERATURE,SAMPLING_ITERATIONS,EMBEDDING_DATA
+from debug_logging import truncate_text
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 global_tokenizer = AutoTokenizer.from_pretrained('BAAI/bge-reranker-base')
@@ -29,12 +31,12 @@ except:
     nlp = spacy.load("en_core_web_sm")
 
 
-def generate_response(messages, max_tokens=2000, temperature=0, top_p=1.0, top_k=None, frequency_penalty=0.0, presence_penalty=0.0):
+def generate_response(messages, max_tokens=2000, temperature=0, top_p=1.0, top_k=None, frequency_penalty=0.0, presence_penalty=0.0, debug_collector=None, stage="generate_response", metadata=None):
     
     try:
       
         params = {
-            "model": "gpt-4o-mini", 
+            "model": MODEL_NAME, 
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
@@ -50,6 +52,12 @@ def generate_response(messages, max_tokens=2000, temperature=0, top_p=1.0, top_k
         completion = client.chat.completions.create(**params)
         return completion.choices[0].message.content
     except Exception as e:
+        if debug_collector is not None:
+            error_details = {"exception_type": type(e).__name__}
+            if metadata:
+                error_details.update(metadata)
+            debug_collector.add_error(stage, str(e), error_details)
+            debug_collector.update_summary(generation_failed=True)
         print(f"API_ERROR: {str(e)}")
         return None
 
@@ -117,20 +125,31 @@ def generate_answers(question, n=15, temperature=0.5):
 
 
 def direct_answer(question, dataset, method="bm25", chunk_size=200, min_sentence=2, 
-                      overlap=2, topk1=45, topk2=15):
+                      overlap=2, topk1=45, topk2=15, samples=SAMPLING_ITERATIONS, show_documents=False, debug_collector=None):
     query = extract_keywords(question)
     
     documents = retrieve_documents(query=query, dataset=dataset, method=method, chunk_size=chunk_size, 
-                                    min_sentence=min_sentence, overlap=overlap, topk2=topk2)
-    
+                                    min_sentence=min_sentence, overlap=overlap, topk1=topk1, topk2=topk2, 
+                                    debug_collector=debug_collector, stage="direct_answer.retrieval")
+    if show_documents:
+        print(f"\nRetrieved documents:\n{documents}")
     
     answers = []
-    for _ in range(SAMPLING_ITERATIONS):
-        response = answer_with_reasoning(question, documents=documents)
+    for sample_index in range(max(1, samples)):
+        response = answer_with_reasoning(
+            question,
+            documents=documents,
+            debug_collector=debug_collector,
+            stage="direct_answer.generation",
+            metadata={"sample_index": sample_index + 1, "question": question, "documents_length": len(documents)},
+        )
         print(response)
         parsed_answer = parse_generated_text(response)['answer']
         answers.append(parsed_answer)
     
+    if not answers:
+        return "[none]"
+
     # Count the frequency of each answer
     answer_counts = {}
     for answer in answers:
@@ -149,6 +168,23 @@ def direct_answer(question, dataset, method="bm25", chunk_size=200, min_sentence
     
     # If all answers contain "none", return the most frequent one
     return sorted_answers[0][0]
+
+
+def smoke_test(question, dataset, method="dense", chunk_size=200, min_sentence=2, 
+               overlap=2, topk1=10, topk2=5):
+    print("\nRunning smoke test: single retrieval + single generation.")
+    return direct_answer(
+        question=question,
+        dataset=dataset,
+        method=method,
+        chunk_size=chunk_size,
+        min_sentence=min_sentence,
+        overlap=overlap,
+        topk1=topk1,
+        topk2=topk2,
+        samples=1,
+        show_documents=True,
+    )
 
 def preprocess_documents_for_llm(documents):
     
@@ -174,7 +210,7 @@ def preprocess_documents_for_llm(documents):
     
     return processed_docs
 
-def answer_with_reasoning(question: str, documents: str, max_tokens=10000, temperature=0):
+def answer_with_reasoning(question: str, documents: str, max_tokens=10000, temperature=0, debug_collector=None, stage="answer_with_reasoning", metadata=None):
     """
     Function that answers a question based on provided documents, allowing the LLM to use 
     reasoning and its internal knowledge in addition to document content.
@@ -221,30 +257,70 @@ DOCUMENTS:
         {"role": "user", "content": prompt}
     ]
     
-    # Use the generic API call function
+    generation_started = time.perf_counter()
     response = generate_response(
         messages, 
         max_tokens=max_tokens, 
-        temperature=temperature
+        temperature=temperature,
+        debug_collector=debug_collector,
+        stage=stage,
+        metadata=metadata,
     )
+    generation_elapsed = time.perf_counter() - generation_started
+
+    if debug_collector is not None:
+        debug_collector.add_timing("generation_total_seconds", generation_elapsed)
+        debug_collector.increment_counter("generation_call_count")
     
     # Ensure a valid response is returned
     if not response or response.strip() == "" or response.lower() == "none":
         # Fallback response if the model returns None or empty
-        return "cot: The question requires a response even with limited information. Based on the available documents and general knowledge, I must provide my best assessment. so the answer is: [Best possible answer based on limited information]"
+        response = "cot: The question requires a response even with limited information. Based on the available documents and general knowledge, I must provide my best assessment. so the answer is: [Best possible answer based on limited information]"
+
+    if debug_collector is not None:
+        parsed = parse_generated_text(response)
+        event_metadata = dict(metadata or {})
+        event_metadata["duration_seconds"] = round(generation_elapsed, 4)
+        debug_collector.add_generation_event(
+            stage=stage,
+            model=MODEL_NAME,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            raw_response=response,
+            parsed_answer=parsed["answer"],
+            metadata=event_metadata,
+        )
     
     return response
 
 # Dense retrieval and reranking
 def retrieve_and_rerank_chunks(dataset: str, query: str, chunk_size: int = 200, overlap: int = 2, 
-                             min_sentence: int = 2, coarse_top_k: int = 45, fine_top_k: int = 15) -> List[Dict[str, Any]]:
+                             min_sentence: int = 2, coarse_top_k: int = 45, fine_top_k: int = 15, 
+                             debug_collector=None, stage="dense_retrieval") -> List[Dict[str, Any]]:
    
+    retrieval_started = time.perf_counter()
     try:
         base_path = f"{EMBEDDING_DATA}/{dataset}/{chunk_size}_{min_sentence}_{overlap}"
-        index_files = [f for f in os.listdir(base_path) if f.endswith("_index")]
-        if not index_files:
+        index_file = None
+
+        config_path = os.path.join(base_path, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                index_config = json.load(f)
+            configured_name = index_config.get("index_name")
+            if configured_name:
+                configured_path = os.path.join(base_path, configured_name)
+                if os.path.exists(configured_path):
+                    index_file = configured_path
+
+        if index_file is None:
+            legacy_index_files = [f for f in os.listdir(base_path) if f.endswith("_index")]
+            if legacy_index_files:
+                index_file = os.path.join(base_path, legacy_index_files[0])
+
+        if index_file is None:
             raise FileNotFoundError(f"No index file found in {base_path}")
-        index_file = os.path.join(base_path, index_files[0])
+
         index = faiss.read_index(index_file)
 
         with open(os.path.join(base_path, "chunks.json"), "r", encoding="utf-8") as f:
@@ -271,6 +347,10 @@ def retrieve_and_rerank_chunks(dataset: str, query: str, chunk_size: int = 200, 
                 })
 
         if not coarse_results:
+            retrieval_elapsed = time.perf_counter() - retrieval_started
+            if debug_collector is not None:
+                debug_collector.add_timing("retrieval_total_seconds", retrieval_elapsed)
+                debug_collector.increment_counter("retrieval_call_count")
             return []
 
         
@@ -293,15 +373,40 @@ def retrieve_and_rerank_chunks(dataset: str, query: str, chunk_size: int = 200, 
             coarse_results[i]["rerank_score"] = score
 
         sorted_results = sorted(coarse_results, key=lambda x: x["rerank_score"], reverse=True)
-        return sorted_results[:fine_top_k]
+        final_results = sorted_results[:fine_top_k]
+        retrieval_elapsed = time.perf_counter() - retrieval_started
+        if debug_collector is not None:
+            debug_collector.add_timing("retrieval_total_seconds", retrieval_elapsed)
+            debug_collector.increment_counter("retrieval_call_count")
+            debug_collector.add_retrieval_event(
+                stage=stage,
+                query=query,
+                method="dense",
+                topk1=coarse_top_k,
+                topk2=fine_top_k,
+                items=final_results,
+                metadata={"base_path": base_path, "index_file": index_file, "duration_seconds": round(retrieval_elapsed, 4)},
+            )
+        return final_results
 
     except Exception as e:
+        retrieval_elapsed = time.perf_counter() - retrieval_started
+        if debug_collector is not None:
+            debug_collector.add_timing("retrieval_total_seconds", retrieval_elapsed)
+            debug_collector.increment_counter("retrieval_call_count")
+            debug_collector.add_error(
+                stage,
+                str(e),
+                {"exception_type": type(e).__name__, "query": query, "dataset": dataset, "duration_seconds": round(retrieval_elapsed, 4)},
+            )
+            debug_collector.update_summary(retrieval_failed=True)
         print(f"Dense retrieval failed: {e}")
         return []
 
 # Search using Elasticsearch BM25
-def search_with_bm25(query, dataset, chunk_size, min_sentence, overlap, top_k):
+def search_with_bm25(query, dataset, chunk_size, min_sentence, overlap, top_k, debug_collector=None, stage="bm25_retrieval"):
     """Search documents from Elasticsearch index using BM25"""
+    retrieval_started = time.perf_counter()
     # Build index name
     index_name = f"{dataset}_chunk{chunk_size}_{min_sentence}_{overlap}"
     
@@ -330,12 +435,23 @@ def search_with_bm25(query, dataset, chunk_size, min_sentence, overlap, top_k):
     try:
         response = es.search(index=index_name, body=search_body)
     except Exception as e:
+        retrieval_elapsed = time.perf_counter() - retrieval_started
+        if debug_collector is not None:
+            debug_collector.add_timing("retrieval_total_seconds", retrieval_elapsed)
+            debug_collector.increment_counter("retrieval_call_count")
+            debug_collector.add_error(stage, str(e), {"exception_type": type(e).__name__, "query": query, "duration_seconds": round(retrieval_elapsed, 4)})
+            debug_collector.update_summary(retrieval_failed=True)
         print(f"Elasticsearch search failed: {e}")
         return []
     
     # Process results
     hits = response['hits']['hits']
     if not hits:
+        retrieval_elapsed = time.perf_counter() - retrieval_started
+        if debug_collector is not None:
+            debug_collector.add_timing("retrieval_total_seconds", retrieval_elapsed)
+            debug_collector.increment_counter("retrieval_call_count")
+            debug_collector.update_summary(retrieval_failed=True)
         print("No matching documents found")
         return []
     
@@ -353,12 +469,17 @@ def search_with_bm25(query, dataset, chunk_size, min_sentence, overlap, top_k):
             'text': doc.get('text', 'No content'),
         }
         results.append(result)
+
+    retrieval_elapsed = time.perf_counter() - retrieval_started
+    if debug_collector is not None:
+        debug_collector.add_timing("retrieval_total_seconds", retrieval_elapsed)
+        debug_collector.increment_counter("retrieval_call_count")
     
     return results
 
 # Unified retrieval interface
 def retrieve_documents(query, dataset, method="bm25", chunk_size=200, min_sentence=2, 
-                      overlap=2, topk1=45, topk2=15):
+                      overlap=2, topk1=45, topk2=15, debug_collector=None, stage="retrieve_documents"):
     """
     Unified document retrieval interface, supports BM25 and dense retrieval
     
@@ -381,12 +502,21 @@ def retrieve_documents(query, dataset, method="bm25", chunk_size=200, min_senten
     
     if method.lower() == "bm25":
         # BM25 retrieval
-        raw_results = search_with_bm25(query, dataset, chunk_size, min_sentence, overlap, topk2)
+        raw_results = search_with_bm25(query, dataset, chunk_size, min_sentence, overlap, topk2, debug_collector=debug_collector, stage="bm25_retrieval")
         if not raw_results:
             return "No relevant documents found"
         
         # Sort by score in ascending order, so more relevant documents appear later
         raw_results.sort(key=lambda x: x['score'])
+        if debug_collector is not None:
+            debug_collector.add_retrieval_event(
+                stage=stage,
+                query=query,
+                method="bm25",
+                topk1=topk2,
+                topk2=topk2,
+                items=raw_results,
+            )
             
     elif method.lower() == "dense":
         # Dense retrieval
@@ -398,10 +528,14 @@ def retrieve_documents(query, dataset, method="bm25", chunk_size=200, min_senten
                 overlap=overlap,
                 min_sentence=min_sentence,
                 coarse_top_k=topk1,
-                fine_top_k=topk2
+                fine_top_k=topk2,
+                debug_collector=debug_collector,
+                stage="dense_retrieval",
             )
             
             if not raw_results:
+                if debug_collector is not None:
+                    debug_collector.update_summary(retrieval_failed=True)
                 return "No relevant documents found"
             
             # Sort by rerank_score in ascending order, so more relevant documents appear later
@@ -409,14 +543,22 @@ def retrieve_documents(query, dataset, method="bm25", chunk_size=200, min_senten
             raw_results.sort(key=lambda x: x.get('rerank_score', 0))
                 
         except Exception as e:
+            if debug_collector is not None:
+                debug_collector.add_error(
+                    stage,
+                    f"Dense retrieval failed, trying BM25 fallback: {e}",
+                    {"exception_type": type(e).__name__, "query": query},
+                )
             print(f"Dense retrieval failed, trying to fallback to BM25: {e}")
             # Fallback to BM25 when dense retrieval fails
             return retrieve_documents(query, dataset, method="bm25", chunk_size=chunk_size, 
-                                    min_sentence=min_sentence, overlap=overlap, topk2=topk2)
+                                    min_sentence=min_sentence, overlap=overlap, topk2=topk2, 
+                                    debug_collector=debug_collector, stage="bm25_fallback")
     else:
         print(f"Unsupported retrieval method: {method}, using default BM25")
         return retrieve_documents(query, dataset, method="bm25", chunk_size=chunk_size, 
-                                min_sentence=min_sentence, overlap=overlap, topk2=topk2)
+                                min_sentence=min_sentence, overlap=overlap, topk2=topk2, 
+                                debug_collector=debug_collector, stage="bm25_default")
     
     # Unified document processing logic - segment processing of retrieval results
     formatted_docs = []
@@ -442,7 +584,7 @@ def retrieve_documents(query, dataset, method="bm25", chunk_size=200, min_senten
 
 
 # Call API to generate answer
-def call_api_for_answer(question, documents, max_tokens=2000, temperature=0, top_p=0.9, top_k=1, frequency_penalty=0.2, presence_penalty=0.2):
+def call_api_for_answer(question, documents, max_tokens=2000, temperature=0, top_p=0.9, top_k=1, frequency_penalty=0.2, presence_penalty=0.2, debug_collector=None, stage="call_api_for_answer", metadata=None):
     prompt ="""Instructions: For every question, provide a response in the exact format:
 
 **"question: [question] documents: [list of documents] cot: [chain of thought] so the answer is: [answer]"**.
@@ -617,22 +759,56 @@ You must follow these instructions with absolute precision, without exceptions.
         {"role": "user", "content": prompt}
     ]
     
-    # Use generic API call function
+    generation_started = time.perf_counter()
     response = generate_response(
         messages, 
         max_tokens=max_tokens, 
         temperature=temperature, 
         top_p=top_p, 
         frequency_penalty=frequency_penalty, 
-        presence_penalty=presence_penalty
+        presence_penalty=presence_penalty,
+        debug_collector=debug_collector,
+        stage=stage,
+        metadata=metadata,
     )
+    generation_elapsed = time.perf_counter() - generation_started
+
+    if debug_collector is not None:
+        debug_collector.add_timing("generation_total_seconds", generation_elapsed)
+        debug_collector.increment_counter("generation_call_count")
     
     if response:
+        parsed = parse_generated_text(response)
+        if debug_collector is not None:
+            event_metadata = dict(metadata or {})
+            event_metadata["duration_seconds"] = round(generation_elapsed, 4)
+            debug_collector.add_generation_event(
+                stage=stage,
+                model=MODEL_NAME,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                raw_response=response,
+                parsed_answer=parsed["answer"],
+                metadata=event_metadata,
+            )
         return response
+
+    if debug_collector is not None:
+        event_metadata = dict(metadata or {})
+        event_metadata["duration_seconds"] = round(generation_elapsed, 4)
+        debug_collector.add_generation_event(
+            stage=stage,
+            model=MODEL_NAME,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            raw_response="Error",
+            parsed_answer="Error",
+            metadata=event_metadata,
+        )
     return "Error"
 
 # Generate optimized query
-def generate_refined_query(question, history_queries):
+def generate_refined_query(question, history_queries, debug_collector=None, stage="generate_refined_query", metadata=None):
     """
     Generate an optimized query based on the original question and historical queries.
     """
@@ -679,11 +855,28 @@ New Query:"""
         {"role": "user", "content": new_query_prompt}
     ]
     
-    # Use generic API call function
-    response = generate_response(messages, max_tokens=50, temperature=0.5)
+    refined_query_started = time.perf_counter()
+    response = generate_response(messages, max_tokens=50, temperature=0.5, debug_collector=debug_collector, stage=stage, metadata=metadata)
+    refined_query_elapsed = time.perf_counter() - refined_query_started
+
+    if debug_collector is not None:
+        debug_collector.add_timing("refined_query_total_seconds", refined_query_elapsed)
     
     if response:
-        return response.strip()
+        refined_query = response.strip()
+        if debug_collector is not None:
+            event_metadata = dict(metadata or {})
+            event_metadata["duration_seconds"] = round(refined_query_elapsed, 4)
+            debug_collector.add_generation_event(
+                stage=stage,
+                model=MODEL_NAME,
+                temperature=0.5,
+                max_tokens=50,
+                raw_response=response,
+                parsed_answer=refined_query,
+                metadata=event_metadata,
+            )
+        return refined_query
     else:
         raise Exception("Error generating new query")
 
@@ -799,7 +992,7 @@ def format_full_response(question: str, document: str, generated_text: str) -> s
 # Main function: Iteratively answer questions - using updated parameters
 def answer_question(question: str, dataset: str, method: str = "bm25", chunk_size: int = 200, 
                   min_sentence: int = 2, overlap: int = 2, topk1: int = 45, topk2: int = 15, 
-                  max_iterations: int = 4) -> str:
+                  max_iterations: int = 4, debug_collector=None) -> str:
     """
     Answer questions using iterative method
     
@@ -834,7 +1027,9 @@ def answer_question(question: str, dataset: str, method: str = "bm25", chunk_siz
         min_sentence=min_sentence,
         overlap=overlap,
         topk1=topk1,
-        topk2=topk2
+        topk2=topk2,
+        debug_collector=debug_collector,
+        stage="answer_question.iteration_1.retrieval",
     )
     print(f"\nIteration 1 - Retrieved documents (method: {method}):\n{documents}")
 
@@ -842,7 +1037,14 @@ def answer_question(question: str, dataset: str, method: str = "bm25", chunk_siz
     all_responses = []
     for i in range(SAMPLING_ITERATIONS):
         temp = RETRIEVE_TEMPERATURE # Keep consistent temperature parameter
-        generated_text = call_api_for_answer(question, documents, temperature=temp)
+        generated_text = call_api_for_answer(
+            question,
+            documents,
+            temperature=temp,
+            debug_collector=debug_collector,
+            stage="answer_question.iteration_1.generation",
+            metadata={"iteration": 1, "sample_index": i + 1, "question": question, "documents_length": len(documents)},
+        )
         all_responses.append(generated_text)
         print(f"\nIteration 1 - Generated response #{i+1}:\n{generated_text}")
     
@@ -878,7 +1080,13 @@ def answer_question(question: str, dataset: str, method: str = "bm25", chunk_siz
 
     for iteration in range(2, max_iterations + 1):
         # Generate new optimized query
-        current_query = generate_refined_query(question, history_queries)
+        current_query = generate_refined_query(
+            question,
+            history_queries,
+            debug_collector=debug_collector,
+            stage="answer_question.refined_query",
+            metadata={"iteration": iteration, "history_queries": history_queries},
+        )
         history_queries.append(current_query)
         
         print(f"\nIteration {iteration} - Optimized query: {current_query}")
@@ -892,7 +1100,9 @@ def answer_question(question: str, dataset: str, method: str = "bm25", chunk_siz
             min_sentence=min_sentence,
             overlap=overlap,
             topk1=topk1,
-            topk2=topk2
+            topk2=topk2,
+            debug_collector=debug_collector,
+            stage=f"answer_question.iteration_{iteration}.retrieval",
         )
         history_docs = documents  # Update documents
         
@@ -902,7 +1112,14 @@ def answer_question(question: str, dataset: str, method: str = "bm25", chunk_siz
         all_responses = []
         for i in range(SAMPLING_ITERATIONS):
             temp = RETRIEVE_TEMPERATURE
-            generated_text = call_api_for_answer(question, documents, temperature=temp)
+            generated_text = call_api_for_answer(
+                question,
+                documents,
+                temperature=temp,
+                debug_collector=debug_collector,
+                stage=f"answer_question.iteration_{iteration}.generation",
+                metadata={"iteration": iteration, "sample_index": i + 1, "question": question, "documents_length": len(documents)},
+            )
             all_responses.append(generated_text)
             print(f"\nIteration {iteration} - Generated response #{i+1}:\n{generated_text}")
         
@@ -953,6 +1170,7 @@ if __name__ == "__main__":
     parser.add_argument('--topk1', type=int, default=45, help='Number of results returned by coarse ranking (only for dense method)')
     parser.add_argument('--topk2', type=int, default=15, help='Final number of results returned')
     parser.add_argument('--max_iterations', type=int, default=4, help='Maximum number of iterations')
+    parser.add_argument('--smoke-test', action='store_true', help='Run a minimal single-retrieval, single-generation pipeline check')
     
     args = parser.parse_args()
     
@@ -966,31 +1184,32 @@ if __name__ == "__main__":
     print(f"Coarse ranking results: {args.topk1} (only for dense method)")
     print(f"Final results: {args.topk2}")
     print(f"Maximum iterations: {args.max_iterations}")
+    print(f"Smoke test mode: {args.smoke_test}")
     print("=" * 80)
     
-    # Call main function to answer question
-    answer = answer_question(
-        question=args.query,
-        dataset=args.dataset,
-        method=args.method,
-        chunk_size=args.chunk_size,
-        min_sentence=args.min_sentence,
-        overlap=args.overlap,
-        topk1=args.topk1,
-        topk2=args.topk2,
-        max_iterations=args.max_iterations
-    )
-    answer=direct_answer(
-        question=args.query,
-        dataset=args.dataset,
-        method=args.method,
-        chunk_size=args.chunk_size,
-        min_sentence=args.min_sentence,
-        overlap=args.overlap,
-        topk1=args.topk1,
-        topk2=args.topk2,
-       
-    )
+    if args.smoke_test:
+        answer = smoke_test(
+            question=args.query,
+            dataset=args.dataset,
+            method=args.method,
+            chunk_size=args.chunk_size,
+            min_sentence=args.min_sentence,
+            overlap=args.overlap,
+            topk1=args.topk1,
+            topk2=args.topk2,
+        )
+    else:
+        answer = answer_question(
+            question=args.query,
+            dataset=args.dataset,
+            method=args.method,
+            chunk_size=args.chunk_size,
+            min_sentence=args.min_sentence,
+            overlap=args.overlap,
+            topk1=args.topk1,
+            topk2=args.topk2,
+            max_iterations=args.max_iterations
+        )
     
     print("\nFinal answer:")
     print(answer)

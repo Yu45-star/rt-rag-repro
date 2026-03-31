@@ -6,12 +6,13 @@ from sklearn.metrics.pairwise import cosine_similarity
 import re
 import argparse
 import json
+import time
 from typing import List, Tuple, Dict, Counter
 from collections import Counter, defaultdict
 from openai import OpenAI
 from retrieve import answer_question, direct_answer
 
-from config import  DATASET, METHOD, CHUNK_SIZE, MIN_SENTENCE, OVERLAP, TOPK1, TOPK2, MAX_ITERATIONS, BASE_URL, API_KEY, TREES_PER_QUESTION, MAX_TOKENS,                        DECOMPOSE_TEMPERATURE, TOP_P,FREQUENCY_PENALTY, PRESENCE_PENALTY, NUM_EXAMPLES, MAX_HEIGHT, RIGHT_SUBTREE_VARIANTS, RIGHT_SUBTREE_TREES_PER_VARIANT, MAX_VARIANTS, STATS_FILE_PATH,ENHANCED_RIGHT_SUBTREE
+from config import  DATASET, METHOD, CHUNK_SIZE, MIN_SENTENCE, OVERLAP, TOPK1, TOPK2, MAX_ITERATIONS, BASE_URL, API_KEY, MODEL_NAME, TREES_PER_QUESTION, MAX_TOKENS,                        DECOMPOSE_TEMPERATURE, TOP_P,FREQUENCY_PENALTY, PRESENCE_PENALTY, NUM_EXAMPLES, MAX_HEIGHT, RIGHT_SUBTREE_VARIANTS, RIGHT_SUBTREE_TREES_PER_VARIANT, MAX_VARIANTS, STATS_FILE_PATH,ENHANCED_RIGHT_SUBTREE, QUESTION_TIMEOUT_SECONDS
 client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
 import os
 import datetime
@@ -54,7 +55,7 @@ def generate_response(messages, max_tokens=800, temperature=0.2, top_p=1.0, freq
     """Generic API call function to replace original requests.post call"""
     try:#"Qwen/Qwen2.5-14B-Instruct"
         completion = client.chat.completions.create(
-            model="gpt-4o-mini",  # Can be changed as needed
+            model=MODEL_NAME,
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -1789,197 +1790,424 @@ def get_tree_statistics(root):
     
     return (height, node_count)
 
+
+
+def serialize_question_tree(root):
+    if root is None:
+        return {"root_id": None, "nodes": []}
+
+    nodes = []
+    visited = set()
+
+    def walk(node):
+        if node is None or node.id in visited:
+            return
+        visited.add(node.id)
+        nodes.append({
+            "id": node.id,
+            "type": node.type,
+            "display_question": node.display_question,
+            "answer": node.answer,
+            "depends_on": node.depends_on,
+            "left": node.left.id if node.left else None,
+            "right": node.right.id if node.right else None,
+        })
+        walk(node.left)
+        walk(node.right)
+
+    walk(root)
+    return {"root_id": root.id, "nodes": nodes}
+
+
+def build_tree_shape_summary(tree_shape_counter):
+    return [
+        {
+            "height": shape[0],
+            "node_count": shape[1],
+            "frequency": count,
+        }
+        for shape, count in tree_shape_counter.most_common()
+    ]
+
+
 #---------------------------------------------------- Multi-Tree Multi-Variant Solution -----------------------------------------------
 def decompose_and_answer_with_variants(question, trees_per_question=TREES_PER_QUESTION, api_url=None, max_tokens=MAX_TOKENS, 
                                      temperature=DECOMPOSE_TEMPERATURE, top_p=TOP_P, frequency_penalty=FREQUENCY_PENALTY, presence_penalty=PRESENCE_PENALTY, 
                                      num_examples=NUM_EXAMPLES, max_height=MAX_HEIGHT, enhanced_right_subtree=ENHANCED_RIGHT_SUBTREE,
                                      right_subtree_variants=RIGHT_SUBTREE_VARIANTS, right_subtree_trees_per_variant=RIGHT_SUBTREE_TREES_PER_VARIANT,
-                                     max_variants=MAX_VARIANTS, stats_file_path=STATS_FILE_PATH):
+                                     max_variants=MAX_VARIANTS, stats_file_path=STATS_FILE_PATH, question_started_at=None,
+                                     question_deadline=None, timeout_budget_seconds=QUESTION_TIMEOUT_SECONDS, debug_collector=None):
     """
     Generate 6 trees per question, categorize by shape, and solve only one tree from the most common type.
     If unsuccessful, generate new question variants and try again.
     """
     global global_node_counter
-    
-    # Reset global counter to ensure each call starts from 0
-    global_node_counter = 0
-    
-    examples_db = get_examples_database()
-    
-    # Set trees_per_question to 6 as requested
-    trees_per_question = trees_per_question
-    
-    # Track attempt with original question and variants
-    attempt_count = 0
-    current_question = question
-    attempted_questions = [question]  # Keep track of questions we've tried
-    
-    # Variables to track tree heights
-    initial_height = 0
-    final_height = 0
-    success = False
-    
-    while attempt_count <= MAX_VARIANTS:
-        
-        print(f"\n{'='*80}")
-        print(f"ATTEMPT {attempt_count+1} with question: '{current_question}'")
-        print(f"{'='*80}")
-        
-        all_trees = []
-        
-        # Generate trees for the current question
-        print(f"\nGenerating {trees_per_question} trees for current question (max height: {max_height})")
-        
-        for j in range(trees_per_question):
-            # Use different temperature for tree diversity
-            tree_temp = 0
-            
-            print(f"\nBuilding tree {j+1} for current question (temperature={tree_temp}, max_height={max_height}):")
-            
-            # Build the tree with height limitation
-            root = build_question_tree(
-                current_question, api_url, max_tokens, tree_temp, top_p, frequency_penalty,
-                presence_penalty, examples_db, num_examples, depth=0,
-                placeholder_answers={}, max_height=max_height
-            )
-            
-            # Get tree statistics
-            height, node_count = get_tree_statistics(root)
-            
-            # Save tree information
-            all_trees.append({
-                'tree': root,
-                'tree_num': j+1,
-                'height': height,
-                'node_count': node_count,
-                'question_text': current_question
-            })
-            
-            print(f"Tree {j+1} - Height: {height}, Node count: {node_count}")
-        
-        # Calculate tree shape frequencies
-        tree_shape_counter = Counter()
-        for tree_info in all_trees:
-            shape = (tree_info['height'], tree_info['node_count'])
-            tree_shape_counter[shape] += 1
-        
-        # Print shape frequencies
-        print("\nTree shape frequencies (height, node count):")
-        for shape, count in tree_shape_counter.most_common():
-            print(f"Height: {shape[0]}, Node count: {shape[1]} - Frequency: {count}")
-        
-        # Get the most common shape
-        if tree_shape_counter:
-            most_common_shape, most_common_count = tree_shape_counter.most_common(1)[0]
-            print(f"\nMost common shape: Height {most_common_shape[0]}, Node count {most_common_shape[1]} (Count: {most_common_count})")
-            
-            # Filter trees to only include the most common shape
-            most_common_trees = [tree_info for tree_info in all_trees 
-                               if (tree_info['height'], tree_info['node_count']) == most_common_shape]
-            
-            print(f"Found {len(most_common_trees)} trees with the most common shape")
-            
-            # Only solve the first tree from the most common shape
-            if most_common_trees:
-                tree_info = most_common_trees[0]
-                tree_root = tree_info['tree']
-                question_text = tree_info['question_text']
-                
-                # Save initial height
-                initial_height = tree_info['height']
-                
-                print(f"\n{'-'*80}")
-                print(f"Attempting to solve one tree from most common shape: Tree {tree_info['tree_num']}")
-                print(f"Question: '{question_text}'")
-                print(f"Tree height: {tree_info['height']}, Node count: {tree_info['node_count']}")
-                print(f"{'-'*80}")
-                
-                print("\nTree structure:")
-                print_all_nodes(tree_root)
-                
-                # Create a new placeholder_answers dictionary for each tree to avoid confusion
-                placeholder_answers = {}
-                
-                answer = solve_tree(
-                    tree_root, question_text, api_url, max_tokens, temperature, top_p,
-                    frequency_penalty, presence_penalty, examples_db, num_examples,
-                    enhanced_right_subtree=enhanced_right_subtree,
-                    right_subtree_variants=right_subtree_variants,
-                    right_subtree_trees_per_variant=right_subtree_trees_per_variant,
-                    max_height=max_height,
-                    placeholder_answers=placeholder_answers
+    tree_decompose_started = time.perf_counter()
+
+    try:
+        # Reset global counter to ensure each call starts from 0
+        global_node_counter = 0
+
+        examples_db = get_examples_database()
+
+        # Track attempt with original question and variants
+        attempt_count = 0
+        current_question = question
+        attempted_questions = [question]
+
+        # Variables to track tree heights
+        initial_height = 0
+        final_height = 0
+        success = False
+
+        def timed_out():
+            return question_deadline is not None and time.perf_counter() >= question_deadline
+
+        def timeout_elapsed_seconds():
+            if question_started_at is None:
+                return None
+            return time.perf_counter() - question_started_at
+
+        def finalize_timeout_fallback(stage, attempt_record=None):
+            elapsed = timeout_elapsed_seconds()
+
+            print(f"\n{'-'*80}")
+            print(f"Question exceeded timeout budget at stage '{stage}'. Using direct lookup on original question.")
+            print(f"{'-'*80}")
+
+            if debug_collector is not None:
+                debug_collector.set_timeout(
+                    True,
+                    stage=stage,
+                    elapsed_seconds=elapsed,
+                    budget_seconds=timeout_budget_seconds,
                 )
-                
-                # Calculate the final height after solving (which might have expanded the tree)
-                final_height, _ = get_tree_statistics(tree_root)
-                
-                print(f"\nSelected tree returned answer: '{answer}'")
-                print(f"Initial tree height: {initial_height}, Final tree height after solving: {final_height}")
-                
-                # If we found a valid (non-[none]) answer, use it and stop
-                if answer.lower() != "[none]":
-                    print(f"Found valid answer, stopping tree traversal")
-                    print("\n" + "="*80)
-                    print(f"Final answer for question: '{question}'")
-                    print(f"Answer: '{answer}'")
-                    print("="*80)
-                    
-                    # Save tree statistics
-                    success = True
-                    save_tree_stats(question, answer, initial_height, final_height, stats_file_path, success)
-                    
-                    return answer
-                else:
-                    print(f"Tree returned [none], will try with a new question variant")
-        
-        # Generate question variants
-        attempt_count += 1
-        if attempt_count <= 2:
-            print(f"\n{'-'*80}")
-            print(f"No valid answer found from selected tree. Generating new question variant {attempt_count}")
-            print(f"{'-'*80}")
-            
-            # Use the existing generate_question_variants function
-            new_variants = generate_question_variants(question, num_variants=1)
-            
-            # Get the new variant (skipping the first one which is the original question)
-            if len(new_variants) > 1:
-                new_question = new_variants[1]
-            else:
-                print(f"Warning: generate_question_variants failed to produce a variant, falling back to original question")
-                new_question = question
-            
-            print(f"New question variant {attempt_count}: '{new_question}'")
-            current_question = new_question
-            attempted_questions.append(current_question)
-        else:
-            # If we've exhausted all variants, use direct lookup on the original question
-            print(f"\n{'-'*80}")
-            print("Exhausted all variants. Using direct lookup on original question.")
-            print(f"{'-'*80}")
-            
-            # Directly call answer_question on the original question
-            final_answer = direct_answer(question, dataset=DATASET,
+                debug_collector.set_direct_fallback(True, reason=f"timeout:{stage}")
+                debug_collector.add_error(
+                    "tree_decompose.timeout",
+                    f"Timeout budget exceeded at stage {stage}",
+                    {
+                        "stage": stage,
+                        "timeout_budget_seconds": timeout_budget_seconds,
+                        "timeout_elapsed_seconds": round(elapsed or 0.0, 4),
+                    },
+                )
+
+            direct_fallback_started = time.perf_counter()
+            final_answer = direct_answer(
+                question,
+                dataset=DATASET,
                 method=METHOD,
                 chunk_size=CHUNK_SIZE,
                 min_sentence=MIN_SENTENCE,
                 overlap=OVERLAP,
                 topk1=TOPK1,
                 topk2=TOPK2,
+                debug_collector=debug_collector,
             )
-            
-            # Save tree statistics with direct lookup
-            success = False
-            save_tree_stats(question, final_answer, initial_height, final_height, stats_file_path, success)
-            
+            direct_fallback_elapsed = time.perf_counter() - direct_fallback_started
+
+            if attempt_record is not None:
+                attempt_record["final_answer"] = final_answer
+                attempt_record["direct_fallback_seconds"] = direct_fallback_elapsed
+
+            if debug_collector is not None:
+                debug_collector.add_timing("direct_fallback_seconds", direct_fallback_elapsed)
+                if attempt_record is not None:
+                    if attempt_record.get("selected_tree"):
+                        debug_collector.set_selected_tree(
+                            {"attempt_index": attempt_record["attempt_index"], **attempt_record["selected_tree"]}
+                        )
+                    debug_collector.add_tree_attempt(attempt_record)
+
+            save_tree_stats(question, final_answer, initial_height, final_height, stats_file_path, False)
             return final_answer
-    
-    # If we somehow get here (should not happen with the logic above)
-    # Save tree statistics as a failure
-    success = False
-    save_tree_stats(question, "Could not determine an answer", initial_height, final_height, stats_file_path, success)
-    
-    return "Could not determine an answer after trying original question and variants."
+
+        while attempt_count <= max_variants:
+            if timed_out():
+                return finalize_timeout_fallback("before_attempt")
+            attempt_started = time.perf_counter()
+            attempt_record = {
+                "attempt_index": attempt_count + 1,
+                "question": current_question,
+                "trees_generated": 0,
+                "tree_shapes": [],
+                "selected_tree": None,
+                "final_answer": None,
+                "solve_tree_seconds": 0.0,
+                "variant_generation_seconds": 0.0,
+                "attempt_total_seconds": 0.0,
+            }
+
+            print(f"\n{'='*80}")
+            print(f"ATTEMPT {attempt_count + 1} with question: '{current_question}'")
+            print(f"{'='*80}")
+
+            all_trees = []
+
+            print(f"\nGenerating {trees_per_question} trees for current question (max height: {max_height})")
+
+            for j in range(trees_per_question):
+                if timed_out():
+                    attempt_record["attempt_total_seconds"] = time.perf_counter() - attempt_started
+                    return finalize_timeout_fallback("before_build_tree", attempt_record)
+
+                tree_temp = 0
+                print(f"\nBuilding tree {j + 1} for current question (temperature={tree_temp}, max_height={max_height}):")
+
+                root = build_question_tree(
+                    current_question,
+                    api_url,
+                    max_tokens,
+                    tree_temp,
+                    top_p,
+                    frequency_penalty,
+                    presence_penalty,
+                    examples_db,
+                    num_examples,
+                    depth=0,
+                    placeholder_answers={},
+                    max_height=max_height,
+                )
+
+                height, node_count = get_tree_statistics(root)
+                all_trees.append(
+                    {
+                        "tree": root,
+                        "tree_num": j + 1,
+                        "height": height,
+                        "node_count": node_count,
+                        "question_text": current_question,
+                    }
+                )
+
+                print(f"Tree {j + 1} - Height: {height}, Node count: {node_count}")
+
+            attempt_record["trees_generated"] = len(all_trees)
+
+            tree_shape_counter = Counter()
+            for tree_info in all_trees:
+                shape = (tree_info["height"], tree_info["node_count"])
+                tree_shape_counter[shape] += 1
+
+            attempt_record["tree_shapes"] = build_tree_shape_summary(tree_shape_counter)
+
+            print("\nTree shape frequencies (height, node count):")
+            for shape, count in tree_shape_counter.most_common():
+                print(f"Height: {shape[0]}, Node count: {shape[1]} - Frequency: {count}")
+
+            if tree_shape_counter:
+                most_common_shape, most_common_count = tree_shape_counter.most_common(1)[0]
+                attempt_record["most_common_shape"] = {
+                    "height": most_common_shape[0],
+                    "node_count": most_common_shape[1],
+                    "frequency": most_common_count,
+                }
+                print(
+                    f"\nMost common shape: Height {most_common_shape[0]}, "
+                    f"Node count {most_common_shape[1]} (Count: {most_common_count})"
+                )
+
+                most_common_trees = [
+                    tree_info
+                    for tree_info in all_trees
+                    if (tree_info["height"], tree_info["node_count"]) == most_common_shape
+                ]
+
+                print(f"Found {len(most_common_trees)} trees with the most common shape")
+
+                if most_common_trees:
+                    tree_info = most_common_trees[0]
+                    tree_root = tree_info["tree"]
+                    question_text = tree_info["question_text"]
+                    initial_height = tree_info["height"]
+
+                    print(f"\n{'-'*80}")
+                    print(f"Attempting to solve one tree from most common shape: Tree {tree_info['tree_num']}")
+                    print(f"Question: '{question_text}'")
+                    print(f"Tree height: {tree_info['height']}, Node count: {tree_info['node_count']}")
+                    print(f"{'-'*80}")
+
+                    print("\nTree structure:")
+                    print_all_nodes(tree_root)
+
+                    placeholder_answers = {}
+                    if timed_out():
+                        attempt_record["attempt_total_seconds"] = time.perf_counter() - attempt_started
+                        return finalize_timeout_fallback("before_solve_tree", attempt_record)
+                    solve_tree_started = time.perf_counter()
+                    try:
+                        answer = solve_tree(
+                            tree_root,
+                            question_text,
+                            api_url,
+                            max_tokens,
+                            temperature,
+                            top_p,
+                            frequency_penalty,
+                            presence_penalty,
+                            examples_db,
+                            num_examples,
+                            enhanced_right_subtree=enhanced_right_subtree,
+                            right_subtree_variants=right_subtree_variants,
+                            right_subtree_trees_per_variant=right_subtree_trees_per_variant,
+                            max_height=max_height,
+                            placeholder_answers=placeholder_answers,
+                        )
+                    except Exception as e:
+                        attempt_record["solve_tree_seconds"] = time.perf_counter() - solve_tree_started
+                        attempt_record["attempt_total_seconds"] = time.perf_counter() - attempt_started
+                        if debug_collector is not None:
+                            debug_collector.add_error(
+                                "tree_decompose.solve_tree",
+                                str(e),
+                                {
+                                    "exception_type": type(e).__name__,
+                                    "attempt_index": attempt_record["attempt_index"],
+                                    "tree_num": tree_info["tree_num"],
+                                    "solve_tree_seconds": round(attempt_record["solve_tree_seconds"], 4),
+                                    "attempt_total_seconds": round(attempt_record["attempt_total_seconds"], 4),
+                                },
+                            )
+                            debug_collector.add_tree_attempt(attempt_record)
+                        raise
+
+                    attempt_record["solve_tree_seconds"] = time.perf_counter() - solve_tree_started
+                    final_height, _ = get_tree_statistics(tree_root)
+                    attempt_record["selected_tree"] = {
+                        "tree_num": tree_info["tree_num"],
+                        "question": question_text,
+                        "initial_height": initial_height,
+                        "final_height": final_height,
+                        "node_count": tree_info["node_count"],
+                        "answer": answer,
+                        "tree": serialize_question_tree(tree_root),
+                    }
+                    attempt_record["final_answer"] = answer
+
+                    print(f"\nSelected tree returned answer: '{answer}'")
+                    print(f"Initial tree height: {initial_height}, Final tree height after solving: {final_height}")
+
+                    if answer.lower() != "[none]":
+                        attempt_record["attempt_total_seconds"] = time.perf_counter() - attempt_started
+                        if debug_collector is not None:
+                            debug_collector.set_selected_tree(
+                                {"attempt_index": attempt_record["attempt_index"], **attempt_record["selected_tree"]}
+                            )
+                            debug_collector.add_tree_attempt(attempt_record)
+
+                        print("Found valid answer, stopping tree traversal")
+                        print("\n" + "=" * 80)
+                        print(f"Final answer for question: '{question}'")
+                        print(f"Answer: '{answer}'")
+                        print("=" * 80)
+
+                        success = True
+                        save_tree_stats(question, answer, initial_height, final_height, stats_file_path, success)
+                        return answer
+
+                    if debug_collector is not None:
+                        debug_collector.add_error(
+                            "tree_decompose.none_answer",
+                            "Selected tree returned [none]",
+                            {
+                                "attempt_index": attempt_record["attempt_index"],
+                                "tree_num": tree_info["tree_num"],
+                                "solve_tree_seconds": round(attempt_record["solve_tree_seconds"], 4),
+                            },
+                        )
+                    print("Tree returned [none], will try with a new question variant")
+
+            attempt_count += 1
+            if attempt_count <= max_variants:
+                print(f"\n{'-'*80}")
+                print(f"No valid answer found from selected tree. Generating new question variant {attempt_count}")
+                print(f"{'-'*80}")
+
+                if timed_out():
+                    attempt_record["attempt_total_seconds"] = time.perf_counter() - attempt_started
+                    return finalize_timeout_fallback("before_variant_generation", attempt_record)
+
+                variant_started = time.perf_counter()
+                new_variants = generate_question_variants(question, num_variants=1)
+                attempt_record["variant_generation_seconds"] = time.perf_counter() - variant_started
+
+                if len(new_variants) > 1:
+                    new_question = new_variants[1]
+                else:
+                    print("Warning: generate_question_variants failed to produce a variant, falling back to original question")
+                    if debug_collector is not None:
+                        debug_collector.add_error(
+                            "tree_decompose.variant_generation",
+                            "Failed to produce a new variant, falling back to original question",
+                            {
+                                "attempt_index": attempt_count,
+                                "variant_generation_seconds": round(attempt_record["variant_generation_seconds"], 4),
+                            },
+                        )
+                    new_question = question
+
+                print(f"New question variant {attempt_count}: '{new_question}'")
+                attempt_record["attempt_total_seconds"] = time.perf_counter() - attempt_started
+                if debug_collector is not None:
+                    if attempt_record.get("selected_tree"):
+                        debug_collector.set_selected_tree(
+                            {"attempt_index": attempt_record["attempt_index"], **attempt_record["selected_tree"]}
+                        )
+                    debug_collector.add_variant(
+                        attempt_record["attempt_index"],
+                        current_question,
+                        new_question,
+                        reason="generated_variant",
+                        metadata={"duration_seconds": round(attempt_record["variant_generation_seconds"], 4)},
+                    )
+                    debug_collector.add_tree_attempt(attempt_record)
+                current_question = new_question
+                attempted_questions.append(current_question)
+            else:
+                print(f"\n{'-'*80}")
+                print("Exhausted all variants. Using direct lookup on original question.")
+                print(f"{'-'*80}")
+
+                if debug_collector is not None:
+                    debug_collector.set_direct_fallback(True, reason="exhausted_variants")
+                    debug_collector.add_error(
+                        "tree_decompose.direct_fallback",
+                        "Exhausted variants and falling back to direct_answer",
+                        {"attempt_count": attempt_count},
+                    )
+
+                direct_fallback_started = time.perf_counter()
+                final_answer = direct_answer(
+                    question,
+                    dataset=DATASET,
+                    method=METHOD,
+                    chunk_size=CHUNK_SIZE,
+                    min_sentence=MIN_SENTENCE,
+                    overlap=OVERLAP,
+                    topk1=TOPK1,
+                    topk2=TOPK2,
+                    debug_collector=debug_collector,
+                )
+                direct_fallback_elapsed = time.perf_counter() - direct_fallback_started
+
+                attempt_record["attempt_total_seconds"] = time.perf_counter() - attempt_started
+                attempt_record["final_answer"] = final_answer
+                attempt_record["direct_fallback_seconds"] = direct_fallback_elapsed
+                if debug_collector is not None:
+                    debug_collector.add_timing("direct_fallback_seconds", direct_fallback_elapsed)
+                    debug_collector.add_tree_attempt(attempt_record)
+
+                success = False
+                save_tree_stats(question, final_answer, initial_height, final_height, stats_file_path, success)
+                return final_answer
+
+        success = False
+        save_tree_stats(question, "Could not determine an answer", initial_height, final_height, stats_file_path, success)
+        return "Could not determine an answer after trying original question and variants."
+    finally:
+        if debug_collector is not None:
+            debug_collector.add_timing("tree_decompose_total_seconds", time.perf_counter() - tree_decompose_started)
 
 
 
