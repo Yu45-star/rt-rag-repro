@@ -103,6 +103,7 @@ class BadCaseDebugCollector:
             },
             "retrieval": [],
             "generation": [],
+            "node_trace": [],
             "errors": [],
             "summary": dict(DEFAULT_SUMMARY),
         }
@@ -171,6 +172,19 @@ class BadCaseDebugCollector:
         if details:
             event["details"] = deepcopy(details)
         self.payload["errors"].append(event)
+
+    def add_node_event(self, stage, node_id=None, question=None, answer=None, metadata=None):
+        event = {
+            "stage": stage,
+            "node_id": node_id,
+        }
+        if question is not None:
+            event["question"] = truncate_text(question, MAX_GENERATION_PREVIEW_CHARS)
+        if answer is not None:
+            event["answer"] = truncate_text(answer, MAX_GENERATION_PREVIEW_CHARS)
+        if metadata:
+            event["metadata"] = deepcopy(metadata)
+        self.payload["node_trace"].append(event)
 
     def add_tree_attempt(self, attempt_record):
         self.payload["tree"]["attempts"].append(deepcopy(attempt_record))

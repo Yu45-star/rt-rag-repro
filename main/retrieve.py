@@ -125,12 +125,14 @@ def generate_answers(question, n=15, temperature=0.5):
 
 
 def direct_answer(question, dataset, method="bm25", chunk_size=200, min_sentence=2, 
-                      overlap=2, topk1=45, topk2=15, samples=SAMPLING_ITERATIONS, show_documents=False, debug_collector=None):
+                      overlap=2, topk1=45, topk2=15, samples=SAMPLING_ITERATIONS, show_documents=False, debug_collector=None,
+                      trace_metadata=None, stage_prefix="direct_answer"):
     query = extract_keywords(question)
+    base_metadata = dict(trace_metadata or {})
     
     documents = retrieve_documents(query=query, dataset=dataset, method=method, chunk_size=chunk_size, 
                                     min_sentence=min_sentence, overlap=overlap, topk1=topk1, topk2=topk2, 
-                                    debug_collector=debug_collector, stage="direct_answer.retrieval")
+                                    debug_collector=debug_collector, stage=f"{stage_prefix}.retrieval")
     if show_documents:
         print(f"\nRetrieved documents:\n{documents}")
     
@@ -140,8 +142,8 @@ def direct_answer(question, dataset, method="bm25", chunk_size=200, min_sentence
             question,
             documents=documents,
             debug_collector=debug_collector,
-            stage="direct_answer.generation",
-            metadata={"sample_index": sample_index + 1, "question": question, "documents_length": len(documents)},
+            stage=f"{stage_prefix}.generation",
+            metadata={**base_metadata, "sample_index": sample_index + 1, "question": question, "documents_length": len(documents)},
         )
         print(response)
         parsed_answer = parse_generated_text(response)['answer']
@@ -992,7 +994,8 @@ def format_full_response(question: str, document: str, generated_text: str) -> s
 # Main function: Iteratively answer questions - using updated parameters
 def answer_question(question: str, dataset: str, method: str = "bm25", chunk_size: int = 200, 
                   min_sentence: int = 2, overlap: int = 2, topk1: int = 45, topk2: int = 15, 
-                  max_iterations: int = 4, debug_collector=None) -> str:
+                  max_iterations: int = 4, debug_collector=None, trace_metadata=None,
+                  stage_prefix="answer_question") -> str:
     """
     Answer questions using iterative method
     
@@ -1012,6 +1015,7 @@ def answer_question(question: str, dataset: str, method: str = "bm25", chunk_siz
     """
     # Initialize query history
     history_queries = []
+    base_metadata = dict(trace_metadata or {})
 
     # First round: Use keyword query
     base_query = extract_keywords(question)
@@ -1029,7 +1033,7 @@ def answer_question(question: str, dataset: str, method: str = "bm25", chunk_siz
         topk1=topk1,
         topk2=topk2,
         debug_collector=debug_collector,
-        stage="answer_question.iteration_1.retrieval",
+        stage=f"{stage_prefix}.iteration_1.retrieval",
     )
     print(f"\nIteration 1 - Retrieved documents (method: {method}):\n{documents}")
 
@@ -1042,8 +1046,8 @@ def answer_question(question: str, dataset: str, method: str = "bm25", chunk_siz
             documents,
             temperature=temp,
             debug_collector=debug_collector,
-            stage="answer_question.iteration_1.generation",
-            metadata={"iteration": 1, "sample_index": i + 1, "question": question, "documents_length": len(documents)},
+            stage=f"{stage_prefix}.iteration_1.generation",
+            metadata={**base_metadata, "iteration": 1, "sample_index": i + 1, "question": question, "documents_length": len(documents)},
         )
         all_responses.append(generated_text)
         print(f"\nIteration 1 - Generated response #{i+1}:\n{generated_text}")
@@ -1084,8 +1088,8 @@ def answer_question(question: str, dataset: str, method: str = "bm25", chunk_siz
             question,
             history_queries,
             debug_collector=debug_collector,
-            stage="answer_question.refined_query",
-            metadata={"iteration": iteration, "history_queries": history_queries},
+            stage=f"{stage_prefix}.refined_query",
+            metadata={**base_metadata, "iteration": iteration, "history_queries": history_queries},
         )
         history_queries.append(current_query)
         
@@ -1102,7 +1106,7 @@ def answer_question(question: str, dataset: str, method: str = "bm25", chunk_siz
             topk1=topk1,
             topk2=topk2,
             debug_collector=debug_collector,
-            stage=f"answer_question.iteration_{iteration}.retrieval",
+            stage=f"{stage_prefix}.iteration_{iteration}.retrieval",
         )
         history_docs = documents  # Update documents
         
@@ -1117,8 +1121,8 @@ def answer_question(question: str, dataset: str, method: str = "bm25", chunk_siz
                 documents,
                 temperature=temp,
                 debug_collector=debug_collector,
-                stage=f"answer_question.iteration_{iteration}.generation",
-                metadata={"iteration": iteration, "sample_index": i + 1, "question": question, "documents_length": len(documents)},
+                stage=f"{stage_prefix}.iteration_{iteration}.generation",
+                metadata={**base_metadata, "iteration": iteration, "sample_index": i + 1, "question": question, "documents_length": len(documents)},
             )
             all_responses.append(generated_text)
             print(f"\nIteration {iteration} - Generated response #{i+1}:\n{generated_text}")

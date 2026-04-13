@@ -1452,7 +1452,7 @@ def solve_tree(root, original_question, api_url=None, max_tokens=4000,
               presence_penalty=0.0, examples_db=None, num_examples=20,
               enhanced_right_subtree=True, right_subtree_variants=2, 
               right_subtree_trees_per_variant=2, max_height=3,
-              placeholder_answers=None):
+              placeholder_answers=None, debug_collector=None):
     """
     Solve a single problem tree and return the answer, supporting the construction of an enhanced right subtree
     """
@@ -1463,8 +1463,37 @@ def solve_tree(root, original_question, api_url=None, max_tokens=4000,
     
     
     processed_node_ids = set()
-    
-    
+
+    def log_node_event(stage, node, question=None, answer=None, metadata=None):
+        if debug_collector is None:
+            return
+        event_metadata = {
+            "node_type": node.type if node else None,
+            "display_question": node.display_question if node else None,
+            "depends_on": node.depends_on if node else None,
+        }
+        if metadata:
+            event_metadata.update(metadata)
+        debug_collector.add_node_event(
+            stage=stage,
+            node_id=node.id if node else None,
+            question=question if question is not None else (node.display_question if node else None),
+            answer=answer,
+            metadata=event_metadata,
+        )
+
+    def build_trace_metadata(node, current_depth, resolve_mode, actual_question=None):
+        return {
+            "node_id": node.id,
+            "node_type": node.type,
+            "node_display_question": node.display_question,
+            "node_original_question": node.question,
+            "current_depth": current_depth,
+            "resolve_mode": resolve_mode,
+            "depends_on": node.depends_on,
+            "actual_question": actual_question or node.display_question,
+        }
+
     def solve_node(node, updated_tree=False, current_depth=0):
         if node is None:
             return {}
@@ -1500,6 +1529,7 @@ def solve_tree(root, original_question, api_url=None, max_tokens=4000,
         if node.id in placeholder_answers:
             node.answer = placeholder_answers[node.id]
             node_answers[node.id] = node.answer
+            log_node_event("reuse_placeholder", node, answer=node.answer, metadata={"current_depth": current_depth})
             
             return node_answers
         
@@ -1524,8 +1554,15 @@ def solve_tree(root, original_question, api_url=None, max_tokens=4000,
                     actual_question = actual_question.replace(f"[answer from {node.depends_on}]", dependent_answer)
                 
                 node.display_question = actual_question
+                log_node_event(
+                    "dependency_resolved",
+                    node,
+                    question=actual_question,
+                    answer=dependent_answer,
+                    metadata={"current_depth": current_depth, "depends_on_node": node.depends_on},
+                )
             
-            
+            log_node_event("leaf_question", node, question=actual_question, metadata={"current_depth": current_depth})
             full_response = answer_question(
                 question=actual_question,
                 dataset=DATASET,
@@ -1535,12 +1572,16 @@ def solve_tree(root, original_question, api_url=None, max_tokens=4000,
                 overlap=OVERLAP,
                 topk1=TOPK1,
                 topk2=TOPK2,
-                max_iterations=MAX_ITERATIONS
+                max_iterations=MAX_ITERATIONS,
+                debug_collector=debug_collector,
+                trace_metadata=build_trace_metadata(node, current_depth, "leaf_answer", actual_question),
+                stage_prefix=f"tree.node.{node.id}"
             )
             answer = extract_answer(full_response)
             node.answer = answer
             placeholder_answers[node.id] = answer
             node_answers[node.id] = answer
+            log_node_event("leaf_answer", node, question=actual_question, answer=answer, metadata={"current_depth": current_depth})
             
             
             
@@ -1588,6 +1629,18 @@ def solve_tree(root, original_question, api_url=None, max_tokens=4000,
                 top_p=top_p,
                 frequency_penalty=frequency_penalty,
                 presence_penalty=presence_penalty
+            )
+            log_node_event(
+                "reconstruct_right_subtree_question",
+                node,
+                question=new_right_question,
+                answer=placeholder_answers[node.left.id],
+                metadata={
+                    "current_depth": current_depth,
+                    "left_node_id": node.left.id if node.left else None,
+                    "original_right_question": node.right.question if node.right else None,
+                    "enhanced_right_subtree": True,
+                },
             )
             
            
@@ -1671,6 +1724,13 @@ def solve_tree(root, original_question, api_url=None, max_tokens=4000,
                     )
                     node.right.question = new_question
                     node.right.display_question = new_question
+                    log_node_event(
+                        "refresh_right_question_in_place",
+                        node.right,
+                        question=new_question,
+                        answer=placeholder_answers[node.left.id],
+                        metadata={"current_depth": current_depth, "parent_node_id": node.id},
+                    )
             
            
             right_answers = solve_node(node.right, updated_tree, current_depth + 1)
@@ -1714,6 +1774,16 @@ def solve_tree(root, original_question, api_url=None, max_tokens=4000,
             node.answer = extracted_answer.group(1).strip() if extracted_answer else final_answer
             placeholder_answers[node.id] = node.answer
             node_answers[node.id] = node.answer
+            log_node_event(
+                "aggregate_from_children",
+                node,
+                question=node.display_question,
+                answer=node.answer,
+                metadata={
+                    "current_depth": current_depth,
+                    "child_questions": [{"question": q, "answer": a} for q, a in child_questions],
+                },
+            )
             
             child_answers_str = ", ".join([f"「{q}」: 「{a}」" for q, a in child_questions])
            
@@ -1729,12 +1799,16 @@ def solve_tree(root, original_question, api_url=None, max_tokens=4000,
                     overlap=OVERLAP,
                     topk1=TOPK1,
                     topk2=TOPK2,
-                    max_iterations=MAX_ITERATIONS
+                    max_iterations=MAX_ITERATIONS,
+                    debug_collector=debug_collector,
+                    trace_metadata=build_trace_metadata(node, current_depth, "aggregate_none_fallback", node.display_question),
+                    stage_prefix=f"tree.node.{node.id}.fallback"
                 )
                 answer = extract_answer(full_response)
                 node.answer = answer
                 placeholder_answers[node.id] = answer
                 node_answers[node.id] = answer
+                log_node_event("aggregate_fallback_answer", node, question=node.display_question, answer=answer, metadata={"current_depth": current_depth, "reason": "aggregate_returned_none"})
                
         else:
 
@@ -1748,12 +1822,16 @@ def solve_tree(root, original_question, api_url=None, max_tokens=4000,
                 overlap=OVERLAP,
                 topk1=TOPK1,
                 topk2=TOPK2,
-                max_iterations=MAX_ITERATIONS
+                max_iterations=MAX_ITERATIONS,
+                debug_collector=debug_collector,
+                trace_metadata=build_trace_metadata(node, current_depth, "internal_direct_answer", node.display_question),
+                stage_prefix=f"tree.node.{node.id}.fallback"
             )
             answer = extract_answer(full_response)
             node.answer = answer
             placeholder_answers[node.id] = answer
             node_answers[node.id] = answer
+            log_node_event("internal_direct_answer", node, question=node.display_question, answer=answer, metadata={"current_depth": current_depth, "reason": "no_valid_child_answers"})
            
         
         return node_answers
@@ -1763,6 +1841,17 @@ def solve_tree(root, original_question, api_url=None, max_tokens=4000,
     
 
     final_result = root.answer if root.answer else "[none]"
+    if debug_collector is not None:
+        debug_collector.add_node_event(
+            stage="final_aggregated_answer",
+            node_id=root.id if root else None,
+            question=original_question,
+            answer=final_result,
+            metadata={
+                "root_id": root.id if root else None,
+                "resolved_node_count": len(all_answers),
+            },
+        )
     
     return final_result
 
@@ -2053,6 +2142,7 @@ def decompose_and_answer_with_variants(question, trees_per_question=TREES_PER_QU
                             right_subtree_trees_per_variant=right_subtree_trees_per_variant,
                             max_height=max_height,
                             placeholder_answers=placeholder_answers,
+                            debug_collector=debug_collector,
                         )
                     except Exception as e:
                         attempt_record["solve_tree_seconds"] = time.perf_counter() - solve_tree_started

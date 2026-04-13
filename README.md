@@ -8,7 +8,6 @@
 ## 🔍 What is RT-RAG? 
 ![RT-RAG Overview](assets/overview.png)
 **RT-RAG** systematically decomposes complex multi-hop questions into explicit **binary reasoning trees**. It leverages structured entity analysis and **consensus-based tree selection** to ensure e decomposition, clearly separating core queries, known entities, and unknown targets.
-
 Once the tree is built, a **bottom-up traversal strategy** is used to iteratively rewrite and refine sub-questions. This process efficiently collects high-quality evidence while mitigating error propagation through recursive reasoning.
 
 
@@ -261,6 +260,40 @@ python main/load_data.py --start-index 66 --limit 10
 ```
 
 `--start-index` is a 0-based dataset index. This is useful when you want to resume a previous run from a known offset instead of restarting from the beginning.
+
+### 🧪 Targeted Bad-Case Reruns and Debug Traces
+
+For error analysis, `main/load_data.py` also supports rerunning a small set of questions and forcing per-question debug logs even when the run does not fail:
+
+```bash
+python main/load_data.py \
+  --qids 1c5e70656ffbd6ba33bd853ce406b5efd495e16a3610ed9f \
+  --always-write-debug
+
+python main/load_data.py \
+  --qid-file note/musique_bad_case_qids.txt \
+  --always-write-debug
+```
+
+These options are useful when you want to inspect a few representative MuSiQue failures instead of rerunning the full dataset:
+
+- `--qids`: rerun one or more specific question ids
+- `--qid-file`: load target question ids from a text file, one qid per line
+- `--always-write-debug`: write debug JSON even if the example finishes without an execution failure
+
+Each debug JSON now records the main process-level artifacts needed for deeper error analysis:
+
+- the generated decomposition tree structure
+- retrieved documents and retrieval/generation events at each node
+- intermediate answers propagated between nodes
+- the final aggregated answer returned by the root node
+
+Debug files are written under the active output directory, inside `debug/<result_file_stem>/`, with one JSON file per processed example.
+
+Recommended MuSiQue bad-case lists and rerun commands are included in:
+
+- `note/musique_bad_case_qids.txt`
+- `note/musique_bad_case_rerun.md`
 
 ### ⏱️ Timeout Fallback
 

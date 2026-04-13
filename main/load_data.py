@@ -159,7 +159,7 @@ def build_debug_collector(qid, idx, question, golden_answers):
     return BadCaseDebugCollector(run_metadata, sample_metadata)
 
 
-async def process_example(example, idx, retry_count=0, debug_collector=None):
+async def process_example(example, idx, retry_count=0, debug_collector=None, force_write_debug=False):
     qid = example.get("_id", f"unknown_id_{idx}")
     question = example.get("input", "")
     golden_answers = example.get("answers", [])
@@ -235,7 +235,7 @@ async def process_example(example, idx, retry_count=0, debug_collector=None):
             predicted_answer=predicted_answer,
             failure_reason=failure_reason,
         )
-        if failure_reason:
+        if failure_reason or force_write_debug:
             await write_debug_log(collector, qid, idx)
 
         return result
@@ -287,10 +287,40 @@ def parse_args():
         default=0,
         help="0-based dataset index to resume from",
     )
+    parser.add_argument(
+        "--qids",
+        type=str,
+        default="",
+        help="Comma-separated MuSiQue qids to process. When set, only these qids are rerun.",
+    )
+    parser.add_argument(
+        "--qid-file",
+        type=str,
+        default="",
+        help="Optional file containing one qid per line for targeted reruns.",
+    )
+    parser.add_argument(
+        "--always-write-debug",
+        action="store_true",
+        help="Write debug JSON logs even when the final answer is not classified as an execution failure.",
+    )
     return parser.parse_args()
 
 
-async def main(limit=None, start_index=0):
+def load_target_qids(qids_arg="", qid_file=""):
+    target_qids = []
+    if qids_arg:
+        target_qids.extend([item.strip() for item in qids_arg.split(",") if item.strip()])
+    if qid_file:
+        with open(qid_file, "r", encoding="utf-8") as fin:
+            for line in fin:
+                value = line.strip()
+                if value and not value.startswith("#"):
+                    target_qids.append(value)
+    return list(dict.fromkeys(target_qids))
+
+
+async def main(limit=None, start_index=0, target_qids=None, always_write_debug=False):
     global semaphore
 
     semaphore = asyncio.Semaphore(max_concurrent)
@@ -316,7 +346,19 @@ async def main(limit=None, start_index=0):
 
     os.makedirs(output_dir, exist_ok=True)
 
-    tasks = [process_example(data[idx], idx) for idx in range(start_index, end_index)]
+    selected_indices = list(range(start_index, end_index))
+    if target_qids:
+        target_qid_set = set(target_qids)
+        selected_indices = [idx for idx in selected_indices if data[idx].get("_id") in target_qid_set]
+        missing_qids = [qid for qid in target_qids if qid not in {data[idx].get("_id") for idx in selected_indices}]
+        print(f"Filtering run to {len(selected_indices)} matched qids")
+        if missing_qids:
+            print(f"Warning: {len(missing_qids)} requested qids were not found: {missing_qids}")
+
+    tasks = [
+        process_example(data[idx], idx, force_write_debug=(always_write_debug or bool(target_qids)))
+        for idx in selected_indices
+    ]
 
     results = await tqdm_asyncio.gather(*tasks, desc=f"Processing {dataset_name} dataset")
 
@@ -329,4 +371,12 @@ async def main(limit=None, start_index=0):
 
 if __name__ == "__main__":
     args = parse_args()
-    asyncio.run(main(limit=args.limit, start_index=args.start_index))
+    target_qids = load_target_qids(args.qids, args.qid_file)
+    asyncio.run(
+        main(
+            limit=args.limit,
+            start_index=args.start_index,
+            target_qids=target_qids,
+            always_write_debug=args.always_write_debug,
+        )
+    )
