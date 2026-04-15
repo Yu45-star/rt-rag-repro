@@ -172,6 +172,20 @@ The repository now version-controls benchmark inputs under `data/longbench/`, in
 - `data/longbench/musique_100_seed42.jsonl`: fixed 100-question MuSiQue subset
 - `data/longbench/musique_100_seed42.meta.json`: metadata describing the source file, sample size, seed, and selected indices
 
+To prepare additional fixed 100-question evaluation subsets, use the generic sampling script. For example, this creates the HotpotQA subset while keeping the dense index built on the full corpus:
+
+```bash
+python scripts/sample_subset.py \
+  --dataset hotpotqa \
+  --input data/longbench/hotpotqa.jsonl \
+  --output data/longbench/hotpotqa_100_seed42.jsonl \
+  --meta data/longbench/hotpotqa_100_seed42.meta.json \
+  --sample-size 100 \
+  --seed 42
+```
+
+Dense indexes should be built on the full raw corpus (for example `main/raw/hotpotqa.json`), while evaluation runs can use a fixed sampled subset such as `data/longbench/hotpotqa_100_seed42.jsonl`.
+
 Generated artifacts are still kept local and ignored by git, including:
 
 - `data/embeddings/`
@@ -204,6 +218,12 @@ Once `main/build_dense_index/config.py` is ready, build your FAISS index with:
 
 ```bash
 python main/build_dense_index/dense_build_index.py
+```
+
+For the full HotpotQA corpus, use the dedicated config module:
+
+```bash
+python main/build_dense_index/dense_build_index.py --config config_hotpotqa
 ```
 
 ---
