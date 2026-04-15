@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+import argparse
+import importlib
 import json 
 import re  
 import os 
@@ -9,8 +11,6 @@ import numpy as np
 from tqdm import tqdm
 import faiss
 from openai import OpenAI
-
-import config  # Import configuration
 
 def get_word_count(text):
     """Count the number of words, including Chinese characters"""
@@ -83,29 +83,34 @@ def process_data(file_path, chunk_size, min_sentence, overlap, save_path):
     
     return processed_chunks
 
-def calculate_openai_embeddings(content, vector_store_path):
+def calculate_openai_embeddings(content, vector_store_path, base_url, api_key, max_retries=3):
     """Calculate OpenAI embeddings and save as FAISS index and NumPy array"""
     print(f"\nSaving FAISS index to: {vector_store_path}")  
     client = OpenAI(
-        base_url=config.base_url,
-        api_key=config.api_key
+        base_url=base_url,
+        api_key=api_key
     )
     embeddings = []
     batch_size = 10
 
     for i in tqdm(range(0, len(content), batch_size), desc="Calculating OpenAI embeddings"):
         batch = content[i:i+batch_size]
-        try:
-            response = client.embeddings.create(
-                input=batch,
-                model="text-embedding-3-small"
-            )
-            batch_embeddings = [item.embedding for item in response.data]
-            embeddings.extend(batch_embeddings)
-        except Exception as e:
-            print(f"Error in batch {i}-{i+batch_size}: {e}")
-            time.sleep(5)
-            i -= batch_size
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = client.embeddings.create(
+                    input=batch,
+                    model="text-embedding-3-small"
+                )
+                batch_embeddings = [item.embedding for item in response.data]
+                embeddings.extend(batch_embeddings)
+                break
+            except Exception as e:
+                print(f"Error in batch {i}-{i+batch_size} (attempt {attempt}/{max_retries}): {e}")
+                if attempt == max_retries:
+                    raise RuntimeError(
+                        f"Failed to fetch embeddings for batch {i}-{i+batch_size} after {max_retries} attempts."
+                    ) from e
+                time.sleep(5)
     
     embeddings_array = np.array(embeddings).astype('float32')
     
@@ -120,9 +125,23 @@ def calculate_openai_embeddings(content, vector_store_path):
     
     return embeddings_array
 
+def load_config(config_module_name):
+    """Load a build configuration module by name."""
+    return importlib.import_module(config_module_name)
+
 def main():
     """Main execution pipeline"""
+    parser = argparse.ArgumentParser(description="Build a dense retrieval index for a dataset.")
+    parser.add_argument(
+        "--config",
+        default=os.getenv("RT_RAG_DENSE_CONFIG_MODULE", "config"),
+        help="Configuration module name to import from main/build_dense_index (default: config).",
+    )
+    args = parser.parse_args()
+
+    config = load_config(args.config)
     dataset_name = config.dataset_name
+    raw_file_name = getattr(config, "raw_file_name", dataset_name)
     chunk_size = config.chunk_size
     min_sentence = config.min_sentence
     overlap = config.overlap
@@ -130,8 +149,9 @@ def main():
     save_path = config.save_path
     index_name = f"{dataset_name}_chunk{chunk_size}_{min_sentence}_{overlap}"
     vector_store_path = f"{save_path}/{index_name}"
-    file_path=f"{raw_path}/{dataset_name}.json"
+    file_path = f"{raw_path}/{raw_file_name}.json"
     print(f"\nProcessing dataset: {dataset_name}")
+    print(f"Using config module: {args.config}")
     print(f"Data path: {file_path}")
     print(f"Chunk size: {chunk_size}, Minimum sentences: {min_sentence}, Overlap: {overlap}")
     print(f"Output directory: {save_path}")
@@ -146,7 +166,7 @@ def main():
 
     print("\nCalculating OpenAI embeddings...")
     start_time = time.time()
-    embeddings = calculate_openai_embeddings(content, vector_store_path)
+    embeddings = calculate_openai_embeddings(content, vector_store_path, config.base_url, config.api_key)
     end_time = time.time()
     
     print(f"\nOpenAI embedding generation complete in {end_time - start_time:.2f} seconds.")
@@ -160,6 +180,7 @@ def main():
             "overlap": overlap,
             "embedding_model": "text-embedding-3-small",
             "dataset_name": dataset_name,
+            "raw_file_name": raw_file_name,
             "index_name": index_name,
             "input_file": file_path
         }, f, indent=2)
