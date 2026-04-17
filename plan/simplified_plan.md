@@ -3,10 +3,12 @@
 ## 背景与现状
 
 课程项目，复现并扩展 RT-RAG。Baseline 已完成：
-- **数据集**: MuSiQue-100 (`data/longbench/musique_100_seed42.jsonl`)
-- **配置**: `main/config.py`（轻量：2棵树，topk1=25，topk2=8）
-- **结果**: 38% EM，62道题答错
-- **错误分析**: 已完成，见 `output/musique/dense_chunk200_topk1_25_topk2_8/`
+- **MuSiQue-100** (`data/longbench/musique_100_seed42.jsonl`)：38% EM，62道题答错
+  - 配置：`main/config.py`（轻量：2棵树，topk1=25，topk2=8）
+  - 错误分析已完成，见 `output/musique/dense_chunk200_topk1_25_topk2_8/`
+- **2WikiMQA-100** (`data/longbench/2wikimqa_100_seed42.jsonl`)：**69% EM，79.26% F1**（2026-04-16 完成）
+  - 结果见 `output/2wikimqa/dense_chunk200_topk1_25_topk2_8/run_summary.md`
+  - 注：2WikiMQA 的 100 题子集、dense index (`data/embeddings/2wikimqa/`)、baseline 输出均已就绪
 
 **错误分布**（来自 error_analysis_report.md）：
 | 错误类型 | 数量 | 占比 |
@@ -39,7 +41,7 @@
 | 答案类型混淆（13%） | 通过 typed query formulation 和 type-aware rewrite，引导模型检索并生成更符合目标类型的答案 |
 | 时间锚点错误（21%） | 在检索 query 里嵌入时间上下文，引导模型关注对应时期 |
 | Fallback 乱猜（37% of errors） | Fallback 时让 LLM 自判"文档是否支持该答案"，不支持则返回 `[none]` |
-| 多跳中间节点误差传播（26%） | 子节点低置信度时父节点触发 direct retrieval，绕过坏掉的子节点 |
+| 多跳中间节点误差传播（26%） | **目标限定为 [none]-型阻塞**：子节点无法返回任何答案（`answer=="[none]"` 且 `confidence=="low"`）时，父节点触发 direct retrieval 绕过死掉的子树。子节点返回错误实体（非 [none]）的情况不在本机制覆盖范围——那是检索层根因，parent fallback 对此基本无效。 |
 
 ---
 
@@ -53,25 +55,23 @@
 
 ```
 main/
-  control_helpers.py             ← 轻量控制辅助工具，非硬性规则验证器（新建）
-  tree_decompose_adaptive.py     ← typed node + 自适应求解（新建）
-  config_adaptive.py             ← 新方法配置（新建）
-  load_data_adaptive.py          ← 新入口（新建）
+  control_helpers.py             ← 轻量控制辅助工具，非硬性规则验证器 ✓ 已实现
+  tree_decompose_adaptive.py     ← typed node 标注 + 自适应求解 ✓ 已实现
+  config_adaptive.py             ← 新方法配置，含 METHOD_TAG ✓ 已实现
+  load_data_adaptive.py          ← 新入口，额外记录 adaptive stats ✓ 已实现
 
-scripts/
-  sample_subset.py               ← 数据集抽样脚本（新建）
+output/musique/
+  bad_cases_qids.txt             ← 62 个 bad case 的 qid 列表 ✓ 已生成
+  adaptive_typed_v1/             ← MuSiQue 上的新方法结果（待跑）
 
-data/longbench/
-  2wikimqa_100_seed42.jsonl      ← 第二数据集子集（新建）
-  2wikimqa_100_seed42.meta.json  ← 抽样元数据（新建）
-
-data/embeddings/2wikimqa/        ← 2WikiMQA dense index（新建，需构建）
-
-output/
-  musique/adaptive_typed_v1/     ← MuSiQue 上的新方法结果
-  2wikimqa/baseline/             ← 2WikiMQA 上的 baseline 结果
-  2wikimqa/adaptive_typed_v1/    ← 2WikiMQA 上的新方法结果
+output/2wikimqa/
+  adaptive_typed_v1/             ← 2WikiMQA 上的新方法结果（待跑）
 ```
+
+已就绪（无需再建）：
+- `data/longbench/2wikimqa_100_seed42.jsonl` ✓
+- `data/embeddings/2wikimqa/` ✓
+- `output/2wikimqa/dense_chunk200_topk1_25_topk2_8/` ✓（baseline 结果）
 
 ---
 
@@ -110,42 +110,55 @@ def check_fallback_supported(question: str, candidate: str,
 
 ### 第二步：`main/tree_decompose_adaptive.py`
 
-#### 2a. TypedQuestionNode
+#### 2a. 节点标注：`annotate_tree_nodes()`
 
-继承 `main/tree_decompose.py` 中的 `QuestionNode`（定义在 line 1169）：
+**不新建 TypedQuestionNode 子类**——`build_question_tree()` 返回的是 `QuestionNode` 实例且节点之间通过 `.left` / `.right` 互相引用，替换节点类型需要更新所有引用，容易引入 bug。改用 **duck typing**：遍历树后通过 `setattr` 给每个 `QuestionNode` 实例动态附加以下属性：
 
 ```python
-from main.tree_decompose import QuestionNode
-
-class TypedQuestionNode(QuestionNode):
-    def __init__(self, ...):
-        super().__init__(...)
-        self.answer_type = "other"    # 预测类型: person/org/location/date/number/other
-        self.entity_anchor = None     # 重写时必须保留的关键实体
-        self.confidence = "high"      # "high" 或 "low"，软置信度标记，不硬截断
-        self.retry_done = False       # 是否已经做过 query rewrite
+def annotate_tree_nodes(root):
+    """遍历树，给每个节点附加 adaptive 扩展属性。"""
+    def walk(node):
+        if node is None:
+            return
+        node.answer_type = infer_answer_type(node.display_question)
+        node.entity_anchor = extract_entity_anchor(node.display_question)
+        node.confidence = "high"
+        node.retry_done = False
+        node.used_direct_retrieval_fallback = False
+        walk(node.left)
+        walk(node.right)
+    walk(root)
 ```
 
-#### 2b. `build_typed_question_tree()`
+附加属性含义：
+- `answer_type`：预测类型（person/org/location/date/number/other）
+- `entity_anchor`：重写时保留的关键实体短语，抽不到则为 `None`
+- `confidence`：软置信度标记（"high"/"low"），不硬截断
+- `retry_done`：是否已触发过 query rewrite
+- `used_direct_retrieval_fallback`：是否触发过 parent-level direct retrieval fallback
 
-复用 `build_question_tree()`（line 1208）建树，然后对每个节点用**启发式规则**推断 `answer_type`（优先不增加 LLM 调用）：
-- "who" → person
-- "where" / "in which" → location
-- "when" / "what year" → date
-- "how many" / "how much" → number
+#### 2b. 辅助函数
+
+**`infer_answer_type(question)`**：规则推断（不增加 LLM 调用）：
+- "who" → person；"where" / "in which" → location
+- "when" / "what year" → date；"how many" / "how much" → number
 - 其余 → other
 
-同时从问题文本中提取 `entity_anchor`，规则如下：
-- 取当前 node 问句中**不是 WH-word（who/what/where/when/how）、也不是占位符**的主实体短语
-- 如果当前 node 依赖父节点答案（`depends_on` 非空），优先保留父节点填入后的实体
-- 如果抽不出来，允许为 `None`，不强行生成
-- 用于重试时约束查询，防止 rewrite 丢失关键检索锚点
+**`extract_entity_anchor(question)`**：正则提取首个大写多词短语（如 "Battle of Brechin"）作为锚点实体；若抽不到则返回 `None`，不强行生成。
 
-#### 2c. `adaptive_solve_tree()`
+**`build_typed_retrieval_query(question, answer_type, entity_anchor)`**：将类型和实体信息**融入问题表述**，生成自然语言重写（不使用方括号元语言）。例如：`"Who is the person that [original question]"`，而不是 `"[Looking for a person] Who..."`。
+
+> 原因：`answer_question()` 会把传入的 question 字符串同时用于 `extract_keywords(question)`（检索）和 `call_api_for_answer(question, docs)`（生成 prompt），没有独立的 retrieval_query 参数。如果类型提示用方括号元语言写成，既会在关键词提取里产生噪声，也会污染 LLM 的生成 prompt。改用自然语言重写，在检索和生成两侧都合法，同时保留方向性引导。
+
+**`build_rewritten_query(question, entity_anchor, answer_type)`**：可疑时的重写版本，加 `Focus on '...' The answer should be a ...` 前缀，锚定关键实体 + 类型。
+
+#### 2c. `adaptive_solve_tree(root, ..., stats)`
 
 核心机制是 **type-aware query rewriting + 软置信度传播**，不做硬截断。
 
-实现方式：在 `tree_decompose_adaptive.py` 中重新实现 `adaptive_solve_tree()`，复制 `solve_tree()` 的结构，在叶节点求解阶段插入以下逻辑：
+实现方式：复制 `solve_tree()`（line 1450）的完整代码，在两处插入新逻辑，其余保持一致。新增参数 `stats: dict`，由调用方（`adaptive_decompose_and_answer_with_variants`）创建并传入，用于累计各项指标。
+
+**叶节点求解（三层策略）**（插入位置：原 `answer_question` 调用后、`node.answer = answer` 赋值前）：
 
 **叶节点求解（三层策略）**：
 
@@ -206,19 +219,40 @@ else:
     parent.used_direct_retrieval_fallback = False
 ```
 
-#### 2d. `adaptive_direct_answer()`（fallback 门控）
+#### 2d. Fallback 门控（内嵌于 `adaptive_decompose_and_answer_with_variants`）
 
-替换 `tree_decompose_and_answer()`（line 1890）中对 `direct_answer()` 的调用：
+不单独写 `adaptive_direct_answer` 函数——门控逻辑直接内嵌在 `adaptive_decompose_and_answer_with_variants` 中所有调用 `direct_answer()` 的位置（`finalize_timeout_fallback` 和 exhausted-variants fallback 两处）：
 
 ```python
-def adaptive_direct_answer(question, root_answer_type, ...):
-    candidate, docs = direct_answer_with_docs(question, ...)
-    # 用 LLM 判断文档是否支持该答案，而不是 span 匹配规则
-    if check_fallback_supported(question, candidate, docs):
-        return candidate
-    else:
-        return "[none]"  # 无证据支撑时明确失败，不猜测
+# 原来：return direct_answer(question, ...)
+# 改为：
+candidate = direct_answer(question, ...)
+# 需要检索文档用于 support check：用 extract_keywords + retrieve_documents 取文档
+# （direct_answer 内部已检索但不返回，这里额外检索一次，仅在 fallback 路径触发，可接受）
+docs = retrieve_documents(extract_keywords(question), ...)
+if ENABLE_FALLBACK_SUPPORT_CHECK:
+    stats["fallback_gate_checks"] += 1
+    if not check_fallback_supported(question, candidate, docs):
+        stats["fallback_gate_blocked_count"] += 1
+        return "[none]"
+return candidate
 ```
+
+> 注：`retrieve_documents` 和 `extract_keywords` 从 `retrieve.py` 导入。docs 截断至 3000 字符再传入 `check_fallback_supported`。
+
+#### 2e. `adaptive_decompose_and_answer_with_variants()` 返回值
+
+函数签名：
+```python
+def adaptive_decompose_and_answer_with_variants(question, ..., stats=None) -> tuple[str, dict]:
+```
+- `stats` 默认为 `None`，调用方传入一个 `dict` 用于累计（允许跨多次 attempt 累计）
+- 返回 `(answer_str, stats_dict)` 而非纯字符串
+- `load_data_adaptive.py` 中：
+  ```python
+  result = await loop.run_in_executor(None, lambda: adaptive_decompose_and_answer_with_variants(...))
+  predicted_answer, adaptive_stats = result
+  ```
 
 ---
 
@@ -227,7 +261,7 @@ def adaptive_direct_answer(question, root_answer_type, ...):
 继承 `main/config.py` 所有基础配置，仅覆盖以下参数：
 
 ```python
-from main.config import *
+from config import *
 
 # 输出路径：保持现有动态命名规则，新增 METHOD_TAG 插入路径
 METHOD_TAG = "adaptive_typed_v1"
@@ -245,39 +279,44 @@ RETRY_TIMEOUT_BUDGET_FRACTION = 0.25
 
 ### 第四步：`main/load_data_adaptive.py`
 
-基于 `main/load_data.py` 修改，差异仅两处：
-- 从 `config_adaptive` 导入配置（含 `METHOD_TAG`，用于拼输出路径）
-- 调用 `tree_decompose_adaptive.py` 中的**顶层入口函数**（对应原 `tree_decompose_and_answer()`），而不是在 loader 里直接替换底层 `solve_tree` / `direct_answer`
-- 每题额外记录 rewrite 触发次数、parent-level direct retrieval fallback 触发次数、fallback support check 结果
+基于 `main/load_data.py` 修改，差异仅三处：
+1. 从 `config_adaptive` 导入配置（`METHOD_TAG = "adaptive_typed_v1"`），输出目录拼为 `output/{dataset}/adaptive_typed_v1/`
+2. executor lambda 调用 `adaptive_decompose_and_answer_with_variants`，拆包 `(predicted_answer, adaptive_stats)` tuple
+3. `write_result_to_file` 额外写入 6 个 adaptive stats 字段：
+   - `adaptive_rewrite_triggered`：int
+   - `adaptive_rewrite_effective`：int
+   - `adaptive_low_confidence_nodes`：int
+   - `adaptive_parent_direct_fallback`：int
+   - `adaptive_fallback_gate_checks`：int（`check_fallback_supported` 被调用次数）
+   - `adaptive_fallback_gate_blocked_count`：int（门控拦截次数，即返回 `[none]` 次数）
 
 ---
 
 ### 第五步：第二数据集（2WikiMQA-100）
 
-**5a. 构建子集**
+**已就绪**：2WikiMQA-100 子集、dense index、baseline 结果均已完成（见背景与现状）。
 
-写脚本 `scripts/sample_subset.py`，从 `data/longbench/2wikimqa.jsonl` 用 seed=42 随机抽 100 题，输出 `.jsonl` + `.meta.json`。
+只需要在 2WikiMQA 上跑 adaptive 方法。由于 `load_data_adaptive.py` 在模块导入时静态读取配置，"新建一份 config 文件"并不会让同一条命令自动切换数据集。正确做法是**通过环境变量覆盖**：
 
-**5b. 构建 dense index**
+```bash
+RT_RAG_DATASET=2wikimqa \
+RT_RAG_DATA_PATH=data/longbench/2wikimqa_100_seed42.jsonl \
+python main/load_data_adaptive.py
+```
 
-与 MuSiQue 保持相同检索口径，使用 `main/build_dense_index/dense_build_index.py` 在 **2WikiMQA 全量 corpus**（而非 100 题子集）上构建 FAISS 索引，输出到 `data/embeddings/2wikimqa/`。100 题子集仅作为评测 query 集合，不参与 index 构建。参考 MuSiQue 的 `data/embeddings/musique/200_2_2/config.json` 保持相同的 chunk 参数（chunk_size=200, overlap=2）。
-
-**5c. 在 2WikiMQA 上跑 baseline 和 adaptive**
-
-各新建一份 config 文件，指定 `DATASET = "2wikimqa"`、`METHOD = "dense"`、对应 dense index 路径和输出目录。
+这利用了 `config.py` 中已有的 `os.getenv()` 机制，无需新建 config 文件或修改 loader 代码。
 
 ---
 
 ## 实验执行顺序
 
-1. 实现 `control_helpers.py` + `tree_decompose_adaptive.py`（含顶层入口函数）
-2. 实现 `config_adaptive.py` + `load_data_adaptive.py`
-3. `python main/load_data_adaptive.py` → `output/musique/adaptive_typed_v1/`
-4. 对比 MuSiQue baseline 与 adaptive 的 EM/F1
-5. `python scripts/sample_subset.py` → 构建 2WikiMQA-100 子集
-6. `python main/build_dense_index/dense_build_index.py` → 构建 2WikiMQA dense index
-7. `python main/load_data.py`（2wiki baseline config）→ `output/2wikimqa/baseline/`
-8. `python main/load_data_adaptive.py`（2wiki adaptive config）→ `output/2wikimqa/adaptive_typed_v1/`
+1. ✓ 实现 `control_helpers.py` + `tree_decompose_adaptive.py`（含顶层入口函数）
+2. ✓ 实现 `config_adaptive.py` + `load_data_adaptive.py`
+3. ✓ 生成 `output/musique/bad_cases_qids.txt`（从 `output/musique/dense_chunk200_topk1_25_topk2_8/error_analysis_strict_errors.csv` 提取，共 62 行）
+4. **Bad-case 快速验证**：`python main/load_data_adaptive.py --qid-file output/musique/bad_cases_qids.txt`
+5. 对比 adaptive 在 bad cases 上的改善（若无明显改进，调整后重来）
+6. **全量 MuSiQue**（验证满意后）：`python main/load_data_adaptive.py` → `output/musique/adaptive_typed_v1/`
+7. **2WikiMQA adaptive**：`RT_RAG_DATASET=2wikimqa RT_RAG_DATA_PATH=data/longbench/2wikimqa_100_seed42.jsonl python main/load_data_adaptive.py` → `output/2wikimqa/adaptive_typed_v1/`
 
 ---
 
@@ -289,7 +328,7 @@ RETRY_TIMEOUT_BUDGET_FRACTION = 0.25
 - Rewrite 后答案发生变化的比例（rewrite 实际有效的频率）
 - 低置信度节点传播数量（`confidence == "low"` 的节点）
 - **Parent-Level Direct Retrieval Fallback** 触发次数及这些题的正确率（单独统计，用于区分"typed guidance 的贡献"与"父节点绕过分解的贡献"，预期被问到）
-- Fallback 触发率、Fallback gate 拒绝率（返回 `[none]` 的比例）
+- Fallback 触发率（`adaptive_fallback_gate_checks` / 总题数）、Gate 拒绝率（`adaptive_fallback_gate_blocked_count` / `adaptive_fallback_gate_checks`）
 - 按错误类型分类的改善/退步情况（与 baseline 错误分析口径一致）
 
 **课程报告叙述结构**：
@@ -306,7 +345,7 @@ RETRY_TIMEOUT_BUDGET_FRACTION = 0.25
 | `main/tree_decompose.py:1169` | `QuestionNode` 定义 |
 | `main/tree_decompose.py:1208` | `build_question_tree()` |
 | `main/tree_decompose.py:1450` | `solve_tree()` |
-| `main/tree_decompose.py:1890` | `tree_decompose_and_answer()` — 最终答案选择 |
+| `main/tree_decompose.py:1923` | `decompose_and_answer_with_variants()` — 顶层入口 |
 | `main/retrieve.py:995` | `answer_question()` |
 | `main/retrieve.py:483` | `retrieve_documents()` |
 | `main/config.py` | Baseline 配置（不改动） |
@@ -323,7 +362,7 @@ RETRY_TIMEOUT_BUDGET_FRACTION = 0.25
 | Fallback 乱猜 | 23 | 有把握 | `check_fallback_supported()` 直接针对此类，LLM 判断文档不支持则拦截 |
 | 答案类型混淆 | 8 | 有合理把握 | typed query formulation 注入类型约束，mechanism 对准错误根因 |
 | 时间锚点错误 | 13 | 部分有效 | entity_anchor 可能携带时间信息，但原 temporal check 已删除，覆盖不完整 |
-| 多跳中间实体选错 | 16 | 基本无效 | 根因在检索层，相关文档排不进 top-k，query 改写帮助有限 |
+| 多跳中间实体选错 | 16 | 基本无效 | 根因在检索层，相关文档排不进 top-k，query 改写帮助有限；parent fallback 仅覆盖子节点返回 [none] 的情况，子节点返回错误实体不触发 |
 | 地理层级错误 | 8 | 基本无效 | answer_type="location" 粒度太粗，无法区分 county/city/province |
 | 别名/格式伪错误 | 7 | 完全无效 | 评测规范问题，方法层面无法干预 |
 | 过度生成 | 5 | 轻微可能 | typed query 可能使 generation 稍聚焦，但无专门机制 |
