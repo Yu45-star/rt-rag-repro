@@ -44,7 +44,8 @@ def is_answer_suspicious(answer: str, expected_type: str) -> bool:
 
 def check_fallback_supported(question: str, candidate: str, retrieved_docs: str) -> bool:
     """
-    Ask the LLM whether the retrieved docs support the candidate as an answer.
+    Check whether retrieved docs clearly contradict the candidate answer.
+    Returns True (supported/allowed) if docs do NOT contradict the candidate.
     Fails open (returns True) on any error so we don't accidentally block a good answer.
     """
     docs_snippet = retrieved_docs[:3000] if retrieved_docs else ""
@@ -52,8 +53,8 @@ def check_fallback_supported(question: str, candidate: str, retrieved_docs: str)
         f"Documents:\n{docs_snippet}\n\n"
         f"Question: {question}\n"
         f"Candidate answer: {candidate}\n\n"
-        "Do the documents provide evidence that supports this candidate answer? "
-        "Reply with only 'yes' or 'no'."
+        "Do the documents clearly contradict or provide strong evidence against this candidate answer? "
+        "Reply with only 'yes' (contradicted) or 'no' (not contradicted)."
     )
     try:
         response = _client.chat.completions.create(
@@ -63,7 +64,8 @@ def check_fallback_supported(question: str, candidate: str, retrieved_docs: str)
             temperature=0,
         )
         reply = response.choices[0].message.content.strip().lower()
-        return reply.startswith("y")
+        # "yes" = contradicted = block; "no" = not contradicted = allow
+        return not reply.startswith("y")
     except Exception:
         # Fail open: don't block the answer if the support check itself fails
         return True

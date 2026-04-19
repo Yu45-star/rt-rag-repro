@@ -584,6 +584,55 @@ def retrieve_documents(query, dataset, method="bm25", chunk_size=200, min_senten
     return "\n".join(formatted_docs)
 
 
+def multi_query_retrieve_documents(queries, dataset, method="dense", chunk_size=200,
+                                   min_sentence=2, overlap=2, topk1=25, topk2=8,
+                                   debug_collector=None, stage="multi_query_retrieve"):
+    """
+    Retrieve documents using multiple queries, merge by chunk index (keep highest
+    rerank_score per chunk), return top-topk2 formatted as a document string.
+    Falls back to single-query retrieve_documents if multi-query fails.
+    """
+    if method.lower() != "dense" or len(queries) <= 1:
+        return retrieve_documents(queries[0], dataset, method=method,
+                                  chunk_size=chunk_size, min_sentence=min_sentence,
+                                  overlap=overlap, topk1=topk1, topk2=topk2,
+                                  debug_collector=debug_collector, stage=stage)
+
+    merged: dict = {}  # chunk index -> best result dict
+    for i, query in enumerate(queries):
+        try:
+            results = retrieve_and_rerank_chunks(
+                dataset=dataset, query=query,
+                chunk_size=chunk_size, overlap=overlap, min_sentence=min_sentence,
+                coarse_top_k=topk1, fine_top_k=topk2,
+                debug_collector=debug_collector,
+                stage=f"{stage}.q{i + 1}",
+            )
+            for r in results:
+                idx = r["index"]
+                if idx not in merged or r.get("rerank_score", 0) > merged[idx].get("rerank_score", 0):
+                    merged[idx] = r
+        except Exception as e:
+            print(f"multi_query_retrieve_documents: query {i} failed ({e}), skipping")
+
+    if not merged:
+        return "No relevant documents found"
+
+    # Sort ascending by rerank_score (least relevant first) to match retrieve_documents convention
+    top_results = sorted(merged.values(), key=lambda x: x.get("rerank_score", 0))[-topk2:]
+    top_results.sort(key=lambda x: x.get("rerank_score", 0))
+
+    formatted_docs = []
+    doc_index = 1
+    for result in top_results:
+        text = result.get("content", "")
+        for paragraph in text.split("\n\n"):
+            if paragraph.strip() and len(paragraph.strip()) > 1:
+                formatted_docs.append(f"- doc{doc_index}: {paragraph.strip()}")
+                doc_index += 1
+
+    return "\n".join(formatted_docs) if formatted_docs else "No relevant documents found"
+
 
 # Call API to generate answer
 def call_api_for_answer(question, documents, max_tokens=2000, temperature=0, top_p=0.9, top_k=1, frequency_penalty=0.2, presence_penalty=0.2, debug_collector=None, stage="call_api_for_answer", metadata=None):

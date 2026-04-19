@@ -72,16 +72,26 @@ def build_typed_retrieval_query(question: str, answer_type: str, entity_anchor) 
     answer_question() passes this string to both extract_keywords() and the LLM.
     """
     if answer_type == "person" and entity_anchor:
+        if entity_anchor.lower() in question.lower():
+            return question
         return f"Who is the person associated with {entity_anchor}? {question}"
     if answer_type == "person":
         return f"Who is the person that {question.lstrip('Who').lstrip('who').strip()}"
     if answer_type == "location" and entity_anchor:
+        if entity_anchor.lower() in question.lower():
+            return question
         return f"What location is related to {entity_anchor}? {question}"
     if answer_type == "date" and entity_anchor:
+        if entity_anchor.lower() in question.lower():
+            return question
         return f"What date or year is associated with {entity_anchor}? {question}"
     if answer_type == "number" and entity_anchor:
+        if entity_anchor.lower() in question.lower():
+            return question
         return f"What is the number or quantity related to {entity_anchor}? {question}"
     if answer_type == "org" and entity_anchor:
+        if entity_anchor.lower() in question.lower():
+            return question
         return f"Which organisation is associated with {entity_anchor}? {question}"
     # Fallback: return as-is when no useful signal
     return question
@@ -133,7 +143,7 @@ def adaptive_solve_tree(root, original_question, api_url=None, max_tokens=4000,
                         enhanced_right_subtree=True, right_subtree_variants=2,
                         right_subtree_trees_per_variant=2, max_height=3,
                         placeholder_answers=None, debug_collector=None,
-                        stats=None):
+                        stats=None, question_deadline=None):
     """
     Adaptive variant of solve_tree.  Two behavioural insertions relative to
     the baseline:
@@ -181,11 +191,25 @@ def adaptive_solve_tree(root, original_question, api_url=None, max_tokens=4000,
             "actual_question": actual_question or node.display_question,
         }
 
+    def cutoff_node_due_to_timeout(node, current_depth, stage, return_answer="[none]"):
+        node.answer = return_answer
+        node.confidence = "low"
+        placeholder_answers[node.id] = return_answer
+        stats["timeout_cutoff_nodes"] = stats.get("timeout_cutoff_nodes", 0) + 1
+        log_node_event(
+            "node_timeout_cutoff", node, answer=return_answer,
+            metadata={"current_depth": current_depth, "timeout_cutoff": True, "stage": stage},
+        )
+        return {node.id: return_answer}
+
     # ---- inner recursive solver ----
 
     def solve_node(node, updated_tree=False, current_depth=0):
         if node is None:
             return {}
+
+        if question_deadline is not None and time.perf_counter() >= question_deadline:
+            return cutoff_node_due_to_timeout(node, current_depth, "solve_node_entry")
 
         if node.id in processed_node_ids:
             return {node.id: placeholder_answers.get(node.id, "[none]")}
@@ -251,6 +275,8 @@ def adaptive_solve_tree(root, original_question, api_url=None, max_tokens=4000,
             else:
                 query_for_leaf = actual_question
 
+            if question_deadline is not None and time.perf_counter() >= question_deadline:
+                return cutoff_node_due_to_timeout(node, current_depth, "leaf_answer")
             full_response = answer_question(
                 question=query_for_leaf,
                 dataset=DATASET,
@@ -276,25 +302,32 @@ def adaptive_solve_tree(root, original_question, api_url=None, max_tokens=4000,
                 stats["rewrite_triggered"] = stats.get("rewrite_triggered", 0) + 1
                 rewritten_q = build_rewritten_query(
                     actual_question, node.entity_anchor, node.answer_type)
-                retry_response = answer_question(
-                    question=rewritten_q,
-                    dataset=DATASET,
-                    method=METHOD,
-                    chunk_size=CHUNK_SIZE,
-                    min_sentence=MIN_SENTENCE,
-                    overlap=OVERLAP,
-                    topk1=TOPK1,
-                    topk2=TOPK2,
-                    max_iterations=MAX_ITERATIONS,
-                    debug_collector=debug_collector,
-                    trace_metadata=build_trace_metadata(node, current_depth, "leaf_rewrite", rewritten_q),
-                    stage_prefix=f"tree.node.{node.id}.rewrite",
-                )
-                retry_answer = extract_answer(retry_response)
-                if (retry_answer != "[none]"
-                        and not is_answer_suspicious(retry_answer, node.answer_type)):
-                    leaf_answer = retry_answer
-                    stats["rewrite_effective"] = stats.get("rewrite_effective", 0) + 1
+                if question_deadline is not None and time.perf_counter() >= question_deadline:
+                    log_node_event(
+                        "node_timeout_skip_rewrite", node, answer=leaf_answer,
+                        metadata={"current_depth": current_depth, "timeout_cutoff": True,
+                                  "stage": "leaf_rewrite"},
+                    )
+                else:
+                    retry_response = answer_question(
+                        question=rewritten_q,
+                        dataset=DATASET,
+                        method=METHOD,
+                        chunk_size=CHUNK_SIZE,
+                        min_sentence=MIN_SENTENCE,
+                        overlap=OVERLAP,
+                        topk1=TOPK1,
+                        topk2=TOPK2,
+                        max_iterations=MAX_ITERATIONS,
+                        debug_collector=debug_collector,
+                        trace_metadata=build_trace_metadata(node, current_depth, "leaf_rewrite", rewritten_q),
+                        stage_prefix=f"tree.node.{node.id}.rewrite",
+                    )
+                    retry_answer = extract_answer(retry_response)
+                    if (retry_answer != "[none]"
+                            and not is_answer_suspicious(retry_answer, node.answer_type)):
+                        leaf_answer = retry_answer
+                        stats["rewrite_effective"] = stats.get("rewrite_effective", 0) + 1
 
                 node.retry_done = True
                 node.confidence = "low"
@@ -335,6 +368,8 @@ def adaptive_solve_tree(root, original_question, api_url=None, max_tokens=4000,
         if needs_reconstruction and not updated_tree and enhanced_right_subtree:
             from tree_decompose import (generate_right_question_with_llm,
                                         build_enhanced_right_subtree)
+            if question_deadline is not None and time.perf_counter() >= question_deadline:
+                return cutoff_node_due_to_timeout(node, current_depth, "generate_right_question")
             new_right_question = generate_right_question_with_llm(
                 parent_question=node.question,
                 left_question=node.left.question if node.left else "",
@@ -352,6 +387,8 @@ def adaptive_solve_tree(root, original_question, api_url=None, max_tokens=4000,
                                      "original_right_question": node.right.question if node.right else None,
                                      "enhanced_right_subtree": True})
             remaining_height = max(max_height - current_depth - 1, 1)
+            if question_deadline is not None and time.perf_counter() >= question_deadline:
+                return cutoff_node_due_to_timeout(node, current_depth, "right_subtree_rebuild")
             new_right_node = build_enhanced_right_subtree(
                 original_question=new_right_question,
                 left_answer=placeholder_answers[node.left.id],
@@ -370,6 +407,8 @@ def adaptive_solve_tree(root, original_question, api_url=None, max_tokens=4000,
 
         elif needs_reconstruction and not updated_tree:
             from tree_decompose import generate_right_question_with_llm
+            if question_deadline is not None and time.perf_counter() >= question_deadline:
+                return cutoff_node_due_to_timeout(node, current_depth, "generate_right_question")
             new_right_question = generate_right_question_with_llm(
                 parent_question=node.question,
                 left_question=node.left.question if node.left else "",
@@ -380,6 +419,8 @@ def adaptive_solve_tree(root, original_question, api_url=None, max_tokens=4000,
                 presence_penalty=presence_penalty,
             )
             remaining_height = max(max_height - current_depth - 1, 1)
+            if question_deadline is not None and time.perf_counter() >= question_deadline:
+                return cutoff_node_due_to_timeout(node, current_depth, "right_subtree_rebuild")
             new_right_node = build_question_tree(
                 new_right_question, api_url, max_tokens, temperature, top_p,
                 frequency_penalty, presence_penalty, examples_db, num_examples,
@@ -396,6 +437,8 @@ def adaptive_solve_tree(root, original_question, api_url=None, max_tokens=4000,
                      f"[answer from {node.right.depends_on}]" in node.right.question))):
                 if node.left and node.left.id in placeholder_answers:
                     from tree_decompose import generate_right_question_with_llm
+                    if question_deadline is not None and time.perf_counter() >= question_deadline:
+                        return cutoff_node_due_to_timeout(node, current_depth, "generate_right_question")
                     new_question = generate_right_question_with_llm(
                         parent_question=node.question,
                         left_question=node.left.question,
@@ -425,6 +468,8 @@ def adaptive_solve_tree(root, original_question, api_url=None, max_tokens=4000,
         if blocking_children:
             print(f"node {node.id}: child blocking with [none]+low-confidence, "
                   "triggering parent-level direct retrieval fallback")
+            if question_deadline is not None and time.perf_counter() >= question_deadline:
+                return cutoff_node_due_to_timeout(node, current_depth, "parent_direct_fallback")
             full_response = answer_question(
                 node.display_question,
                 dataset=DATASET, method=METHOD,
@@ -472,6 +517,8 @@ def adaptive_solve_tree(root, original_question, api_url=None, max_tokens=4000,
 
         if valid_child_answers and child_questions:
             from tree_decompose import get_final_answer
+            if question_deadline is not None and time.perf_counter() >= question_deadline:
+                return cutoff_node_due_to_timeout(node, current_depth, "get_final_answer")
             final_answer = get_final_answer(node.display_question, child_questions, api_url)
             extracted = re.search(r'final answer is:\s*(.*)', final_answer, re.DOTALL)
             if not extracted:
@@ -486,6 +533,8 @@ def adaptive_solve_tree(root, original_question, api_url=None, max_tokens=4000,
                                                          for q, a in child_questions]})
 
             if node.answer.lower() == "[none]":
+                if question_deadline is not None and time.perf_counter() >= question_deadline:
+                    return cutoff_node_due_to_timeout(node, current_depth, "aggregate_none_fallback")
                 full_response = answer_question(
                     node.display_question,
                     dataset=DATASET, method=METHOD,
@@ -506,6 +555,8 @@ def adaptive_solve_tree(root, original_question, api_url=None, max_tokens=4000,
                                metadata={"current_depth": current_depth,
                                          "reason": "aggregate_returned_none"})
         else:
+            if question_deadline is not None and time.perf_counter() >= question_deadline:
+                return cutoff_node_due_to_timeout(node, current_depth, "internal_direct_answer")
             full_response = answer_question(
                 node.display_question,
                 dataset=DATASET, method=METHOD,
@@ -587,6 +638,7 @@ def adaptive_decompose_and_answer_with_variants(
             "parent_direct_fallback_triggered": 0,
             "fallback_gate_checks": 0,
             "fallback_gate_blocked_count": 0,
+            "timeout_cutoff_nodes": 0,
         }
 
     _td.global_node_counter = 0
@@ -621,7 +673,7 @@ def adaptive_decompose_and_answer_with_variants(
             if ENABLE_FALLBACK_SUPPORT_CHECK and candidate.lower() != "[none]":
                 stats["fallback_gate_checks"] += 1
                 docs = retrieve_documents(
-                    query=extract_keywords(question),
+                    query=extract_keywords(question + " " + candidate),
                     dataset=DATASET, method=METHOD,
                     chunk_size=CHUNK_SIZE, min_sentence=MIN_SENTENCE, overlap=OVERLAP,
                     topk1=TOPK1, topk2=TOPK2,
@@ -775,6 +827,7 @@ def adaptive_decompose_and_answer_with_variants(
                             placeholder_answers=placeholder_answers,
                             debug_collector=debug_collector,
                             stats=stats,
+                            question_deadline=question_deadline,
                         )
                     except Exception as e:
                         attempt_record["solve_tree_seconds"] = time.perf_counter() - solve_tree_started

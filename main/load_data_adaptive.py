@@ -126,6 +126,7 @@ async def write_result_to_file(result, file_path):
         await fout.write(f"adaptive_parent_direct_fallback: {int(adaptive.get('parent_direct_fallback_triggered', 0))}\n")
         await fout.write(f"adaptive_fallback_gate_checks: {int(adaptive.get('fallback_gate_checks', 0))}\n")
         await fout.write(f"adaptive_fallback_gate_blocked_count: {int(adaptive.get('fallback_gate_blocked_count', 0))}\n")
+        await fout.write(f"adaptive_timeout_cutoff_nodes: {int(adaptive.get('timeout_cutoff_nodes', 0))}\n")
         await fout.write("---\n")
         await fout.flush()
 

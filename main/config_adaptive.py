@@ -1,6 +1,10 @@
 from config import *  # noqa: F401, F403
 
-METHOD_TAG = "adaptive_typed_v1"
+METHOD_TAG = "adaptive_typed_v1_single_attempt"
+
+# Runtime trimming for the current bad-case rerun:
+# keep 2 trees in the initial attempt, but disable extra variant attempts.
+MAX_VARIANTS = 0
 
 ANSWER_TYPE_METHOD = "rules"        # rule-based type inference, no extra LLM calls
 ENABLE_TYPE_GUIDANCE = True         # inject answer_type / entity_anchor into retrieval query
