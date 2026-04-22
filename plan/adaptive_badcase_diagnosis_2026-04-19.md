@@ -273,3 +273,35 @@ else:
 ### 🔲 步骤5：添加 `category` 类型识别
 
 ### 🔲 步骤6：全量 62 bad case 重跑对比
+
+---
+
+## 后续评估计划（2026-04-19 更新）
+
+在完成 `adaptive_typed_v1_final` 的 MuSiQue bad 62 最终运行后，后续不再继续新增方法机制，而是进入“补齐评测 + 总结结果”阶段。
+
+### 已拿到的最终 bad-case 结果
+
+- 方法版本：`adaptive_typed_v1_final`
+- MuSiQue bad 62：`4/62` EM 正确（相对 baseline `0/62`，净增 `+4`）
+- 已确认的 EM 增益主要来自 gate 改进
+- multi-query 与 category guidance 主要体现为行为层正信号，尚未大规模转成额外 EM
+
+### 接下来的执行顺序
+
+1. 补跑 MuSiQue fixed-100 中剩余的 `38` 道 baseline-correct 题
+   目标：判断 adaptive 是否会破坏 baseline 原本正确的 case，并据此补齐 MuSiQue fixed-100 的整体结果
+2. 如果时间允许，再跑另一个数据集
+   目标：给 presentation 补一组跨数据集结果，避免结论只停留在 MuSiQue
+3. 最后统一写总总结
+   内容包括：
+   - MuSiQue bad 62 的修复情况
+   - MuSiQue fixed-100 的整体净变化
+   - 另一个数据集上的表现
+   - 方法的有效范围与主要瓶颈
+
+### 当前阶段的原则
+
+- `adaptive_typed_v1_final` 视为已冻结的方法版本
+- 除非发现明确 bug，否则不再继续改动 gate、multi-query、category 或 timeout 相关逻辑
+- 后续工作的重点从“继续改方法”切换为“补齐评估、固定结论、准备汇报”

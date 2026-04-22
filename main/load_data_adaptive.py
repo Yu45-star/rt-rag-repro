@@ -210,6 +210,16 @@ async def process_example(example, idx, retry_count=0, debug_collector=None, for
             print(f"Detected error: {predicted_answer}, retrying question: {qid}")
             current_retry += 1
             collector.set_retry_count(current_retry)
+            # Cap each question at 3 total attempts: initial run + 2 retries.
+            if current_retry >= 2:
+                print(f"Max retries reached for qid: {qid}, skipping.")
+                collector.add_error(
+                    "load_data.retry_exhausted",
+                    predicted_answer,
+                    {"qid": qid, "retry_count": current_retry},
+                )
+                predicted_answer = "[none]"
+                break
 
         collector.set_retry_count(current_retry)
         elapsed = 0.0 if question_started is None else time.perf_counter() - question_started

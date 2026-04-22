@@ -9,7 +9,7 @@ import re
 import time
 from collections import Counter
 
-from retrieve import answer_question, direct_answer, retrieve_documents, extract_keywords
+from retrieve import answer_question, direct_answer, retrieve_documents, extract_keywords, multi_query_retrieve_documents, call_api_for_answer
 from tree_decompose import (
     build_question_tree,
     solve_tree,
@@ -32,7 +32,26 @@ from config_adaptive import (
     ENHANCED_RIGHT_SUBTREE, RIGHT_SUBTREE_VARIANTS, RIGHT_SUBTREE_TREES_PER_VARIANT,
     MAX_VARIANTS, STATS_FILE_PATH, QUESTION_TIMEOUT_SECONDS,
     ENABLE_TYPE_GUIDANCE, ENABLE_TYPE_AWARE_REWRITE, ENABLE_FALLBACK_SUPPORT_CHECK,
+    ENABLE_MULTI_QUERY_FUSION,
 )
+
+
+# ---------------------------------------------------------------------------
+# Helper: answer generation using pre-fetched documents
+# ---------------------------------------------------------------------------
+
+def answer_with_prefetched_docs(question, docs, max_tokens=None, debug_collector=None,
+                                trace_metadata=None, stage_prefix="node"):
+    if max_tokens is None:
+        max_tokens = MAX_TOKENS
+    return call_api_for_answer(
+        question=question,
+        documents=docs,
+        max_tokens=max_tokens,
+        debug_collector=debug_collector,
+        stage=f"{stage_prefix}.answer_with_docs",
+        metadata=trace_metadata,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +70,8 @@ def infer_answer_type(question: str) -> str:
         return "number"
     if re.search(r'\bwhich (company|organization|org|institution|team|party|group)\b', q):
         return "org"
+    if re.search(r'\bis an? instance of\b|\bis a type of\b|\bis a kind of\b|\bis a form of\b', q):
+        return "category"
     return "other"
 
 
@@ -93,6 +114,10 @@ def build_typed_retrieval_query(question: str, answer_type: str, entity_anchor) 
         if entity_anchor.lower() in question.lower():
             return question
         return f"Which organisation is associated with {entity_anchor}? {question}"
+    if answer_type == "category" and entity_anchor:
+        return f"What category or type does {entity_anchor} belong to? {question}"
+    if answer_type == "category":
+        return f"What category or type is involved? {question}"
     # Fallback: return as-is when no useful signal
     return question
 
@@ -108,6 +133,7 @@ def build_rewritten_query(question: str, entity_anchor, answer_type: str) -> str
         "date": "The answer should be a date or year.",
         "number": "The answer should be a number or quantity.",
         "org": "The answer should be an organisation or company name.",
+        "category": "The answer should be a category, type, or class (not a list of specific members).",
     }
     type_hint = type_phrases.get(answer_type, "")
     anchor_hint = f"Focus on '{entity_anchor}'. " if entity_anchor else ""
@@ -277,20 +303,42 @@ def adaptive_solve_tree(root, original_question, api_url=None, max_tokens=4000,
 
             if question_deadline is not None and time.perf_counter() >= question_deadline:
                 return cutoff_node_due_to_timeout(node, current_depth, "leaf_answer")
-            full_response = answer_question(
-                question=query_for_leaf,
-                dataset=DATASET,
-                method=METHOD,
-                chunk_size=CHUNK_SIZE,
-                min_sentence=MIN_SENTENCE,
-                overlap=OVERLAP,
-                topk1=TOPK1,
-                topk2=TOPK2,
-                max_iterations=MAX_ITERATIONS,
-                debug_collector=debug_collector,
-                trace_metadata=build_trace_metadata(node, current_depth, "leaf_answer", query_for_leaf),
-                stage_prefix=f"tree.node.{node.id}",
-            )
+
+            if ENABLE_MULTI_QUERY_FUSION:
+                queries = [query_for_leaf, actual_question]
+                if node.entity_anchor and node.answer_type in ("person", "location", "org"):
+                    queries.append(node.entity_anchor)
+                # deduplicate while preserving order
+                seen = set()
+                queries = [q for q in queries if not (q in seen or seen.add(q))]
+                merged_docs = multi_query_retrieve_documents(
+                    queries, DATASET, METHOD, CHUNK_SIZE, MIN_SENTENCE, OVERLAP,
+                    TOPK1, TOPK2, debug_collector=debug_collector,
+                    stage=f"tree.node.{node.id}.multi_query",
+                )
+                full_response = answer_with_prefetched_docs(
+                    question=actual_question,
+                    docs=merged_docs,
+                    max_tokens=MAX_TOKENS,
+                    debug_collector=debug_collector,
+                    trace_metadata=build_trace_metadata(node, current_depth, "leaf_answer", queries[0]),
+                    stage_prefix=f"tree.node.{node.id}",
+                )
+            else:
+                full_response = answer_question(
+                    question=query_for_leaf,
+                    dataset=DATASET,
+                    method=METHOD,
+                    chunk_size=CHUNK_SIZE,
+                    min_sentence=MIN_SENTENCE,
+                    overlap=OVERLAP,
+                    topk1=TOPK1,
+                    topk2=TOPK2,
+                    max_iterations=MAX_ITERATIONS,
+                    debug_collector=debug_collector,
+                    trace_metadata=build_trace_metadata(node, current_depth, "leaf_answer", query_for_leaf),
+                    stage_prefix=f"tree.node.{node.id}",
+                )
 
             from tree_decompose import extract_answer
             leaf_answer = extract_answer(full_response)
@@ -402,6 +450,7 @@ def adaptive_solve_tree(root, original_question, api_url=None, max_tokens=4000,
                 trees_per_variant=right_subtree_trees_per_variant,
             )
             node.right = new_right_node
+            annotate_tree_nodes(new_right_node)
             right_answers = solve_node(node.right, True, current_depth + 1)
             node_answers.update(right_answers)
 
@@ -428,6 +477,7 @@ def adaptive_solve_tree(root, original_question, api_url=None, max_tokens=4000,
                 max_height=remaining_height, placeholder_answers=placeholder_answers,
             )
             node.right = new_right_node
+            annotate_tree_nodes(new_right_node)
             right_answers = solve_node(node.right, True, current_depth + 1)
             node_answers.update(right_answers)
 

@@ -22,7 +22,7 @@ global_tokenizer = AutoTokenizer.from_pretrained('BAAI/bge-reranker-base')
 global_model = AutoModelForSequenceClassification.from_pretrained('BAAI/bge-reranker-base').to(device)
 global_model.eval()
 
-client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
+client = OpenAI(base_url=BASE_URL, api_key=API_KEY, timeout=180.0)
 try:
     nlp = spacy.load("en_core_web_sm")
 except:
@@ -618,8 +618,7 @@ def multi_query_retrieve_documents(queries, dataset, method="dense", chunk_size=
     if not merged:
         return "No relevant documents found"
 
-    # Sort ascending by rerank_score (least relevant first) to match retrieve_documents convention
-    top_results = sorted(merged.values(), key=lambda x: x.get("rerank_score", 0))[-topk2:]
+    top_results = sorted(merged.values(), key=lambda x: x.get("rerank_score", 0), reverse=True)[:topk2]
     top_results.sort(key=lambda x: x.get("rerank_score", 0))
 
     formatted_docs = []
